@@ -11,6 +11,10 @@ const __dirname = path.dirname(__filename);
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react(), tailwindcss(), viteSingleFile()],
+  server: {
+    // サンドボックスのプレビュー用ホスト（*.e2b.app）を許可する
+    allowedHosts: ['.e2b.app'],
+  },
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "src"),

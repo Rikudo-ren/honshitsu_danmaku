@@ -12,10 +12,14 @@ import {
   B_LINEAR, B_REDIRECT, B_BOUNCE, B_POLAR, B_GRAVITY, B_SINE, B_STEP, B_SPLIT, B_HOMING,
   FL_GRAZED, FL_STOP, FL_FADE, FL_SUPER, FL_NOCULL,
   F_DISPLAY, F_UI, F_MINCHO,
-  DIFFS, STAGES, N_STAGES, STAGE_LABELS, POP_TEXTS, POP_MAA, POP_EXTEND, COUNTDOWN, ENDING_LINES,
+  DIFFS, STAGE_TABLES, N_STAGES, N_STAGES_JUMP, POP_TEXTS, POP_MAA, POP_EXTEND, COUNTDOWN, PATTERN_CAL,
+  ENDING_LINES_ALL, stageLabel,
   levelOf, spdMul, denMul, rateMul,
+  type ModeId, type StageDef,
+  defaultKeys, WASD_ALIAS, type KeyMap, type KeyAction,
 } from './data';
 import { PATTERNS, attractPattern, type PatternDef } from './patterns';
+import { PATTERNS_JUMP } from './patternsJump';
 import { GameAudio } from './audio';
 import { buildSprites, buildDigits, type SpriteSet, type DigitAtlas, DIGIT_DOT, DIGIT_PLUS } from './sprites';
 
@@ -32,6 +36,18 @@ const FAST = 4.3;
 const SLOW = 1.8;
 const GAUGE_MAX = 120;
 
+// ── 無限ジャンプモードの物理（押した長さで跳躍力が変わる） ──
+const GRAV = 0.26;        // 重力加速度
+const JUMP_V0 = 3.2;      // 押した瞬間の上向き初速
+const JUMP_THRUST = 0.17; // 押し続けたときの追加加速
+const JUMP_HOLD = 18;     // 追加加速できる最大フレーム（＝長押しの上限）
+const JUMP_VMAX = 3.4;    // 落下速度の上限
+const HJ_FAST = 3.5;      // 横移動速度
+const HJ_SLOW = 1.7;
+const J_TOP = 16;
+/** ここより下へ落ちたら画面外＝ミス（地面はない） */
+const J_FALL = H + 16;
+
 const WARM = 70;
 const INTRO = 210;
 const GAP = 80;
@@ -47,6 +63,7 @@ export type Mode = 'attract' | 'intro' | 'phase' | 'gap' | 'stageclear' | 'over'
 
 export interface RunResult {
   cleared: boolean;
+  mode: ModeId;
   difficulty: number;
   startStage: number;
   stageReached: number;
@@ -59,7 +76,7 @@ export interface RunResult {
 }
 
 export interface EngineEvents {
-  onStageReached: (d: number, s: number) => void;
+  onStageReached: (m: ModeId, d: number, s: number) => void;
   onEnd: (r: RunResult) => void;
   onPause: (paused: boolean) => void;
 }
@@ -82,7 +99,8 @@ const FONT_COUNT = `96px ${F_DISPLAY}`;
 const FONT_END = `800 19px ${F_MINCHO}`;
 const FONT_BOMBCHIP = `700 9px ${F_UI}`;
 const DIFF_HUD: readonly string[] = DIFFS.map((d) => `${d.name} · 偏差値`);
-const BOSS_HUD: readonly string[] = STAGES.map((s) => `${s.boss}`);
+const BOSS_HUD: readonly (readonly string[])[] = STAGE_TABLES.map((t) => t.map((s) => s.boss));
+const MODE_HUD: readonly string[] = ['回避弾幕', '無限ジャンプ'];
 
 function ease(t: number): number {
   return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
@@ -173,7 +191,7 @@ function genContour(seed: number, color: string): HTMLCanvasElement {
   return c;
 }
 
-function genBase(idx: number, color: string): HTMLCanvasElement {
+function genBase(stars: boolean, color: string, seed: number): HTMLCanvasElement {
   const c = mkCanvas(W, H);
   const g = c.getContext('2d')!;
   const lg = g.createLinearGradient(0, 0, 0, H);
@@ -189,9 +207,9 @@ function genBase(idx: number, color: string): HTMLCanvasElement {
   g.fillStyle = rg;
   g.fillRect(0, 0, W, H);
   g.globalAlpha = 1;
-  // 星（寺地ステージ / タイトル / 最終）
-  if (idx === 2 || idx === 6 || idx === 5) {
-    let s = 987654 + idx;
+  // 星（天文ステージ / 最終ステージ / タイトル）
+  if (stars) {
+    let s = 987654 + seed;
     for (let i = 0; i < 160; i++) {
       s = (s * 1103515245 + 12345) >>> 0;
       const x = (s % 4800) / 10;
@@ -234,11 +252,13 @@ export class Engine {
   private alive = true;
   paused = false;
 
-  private readonly bgBase: HTMLCanvasElement[] = [];
-  private readonly bgContour: HTMLCanvasElement[] = [];
+  private readonly bgBase: HTMLCanvasElement[][] = [[], []];
+  private readonly bgContour: HTMLCanvasElement[][] = [[], []];
+  private readonly bgTitle: HTMLCanvasElement;
+  private readonly bgTitleContour: HTMLCanvasElement;
   private readonly vignette: HTMLCanvasElement;
   private readonly dangerVig: HTMLCanvasElement;
-  private bgIdx = 6;
+  private bgIdx = 0;
   private bgScroll = 0;
 
   // ── Bullets (SoA pool, public for patterns) ─────────────
@@ -322,6 +342,16 @@ export class Engine {
   private kU = false;
   private kD = false;
   private kF = false;
+  private kJ = false;        // ジャンプ押下中（無限ジャンプ）
+  private jumpReq = false;   // 押した瞬間
+  private jumpHoldT = 0;     // 押し続けたフレーム数
+  /** キー割り当て（code → 操作）。設定画面から差し替えられる */
+  private keys: KeyMap = defaultKeys();
+  private keyLookup = new Map<string, KeyAction>();
+  /** キー設定中など、ゲーム側に入力を渡したくないとき true */
+  inputLocked = false;
+  /** 無限ジャンプ：走り出す前。最初のジャンプまで時間が止まっている */
+  private awaitJump = false;
   private bombReq = false;
   private dragId = -1;
   private dragDX = 0;
@@ -335,6 +365,8 @@ export class Engine {
   private touchActive = false;
 
   // ── Game state ─────────────────────────────────────────
+  /** 0: 回避弾幕 / 1: 無限ジャンプ */
+  gameType: ModeId = 0;
   mode: Mode = 'attract';
   private modeT = 0;
   private globalT = 0;
@@ -349,6 +381,8 @@ export class Engine {
   sp = 1;
   dn = 1;
   R = 1;
+  /** パターン別較正係数（beginPhase で PATTERN_CAL から設定される） */
+  cal = 1;
   score = 0;
   private hi = 0;
   lives = 3;
@@ -368,6 +402,7 @@ export class Engine {
   bossY = -80;
   private bossPX = W / 2;
   private bossPY = -80;
+  vy = 0;
   private msx = 0;
   private msy = 0;
   private mtx = 0;
@@ -422,15 +457,20 @@ export class Engine {
     if (!ctx) throw new Error('Canvas 2D unsupported');
     this.ctx = ctx;
     this.events = events;
+    this.setKeys(this.keys);
     this.sprites = buildSprites();
     this.digits = buildDigits('#ffffff', F_UI);
     this.gold = buildDigits('#ffd98a', F_UI);
-    for (let i = 0; i < N_STAGES; i++) {
-      this.bgBase.push(genBase(i, STAGES[i].color));
-      this.bgContour.push(genContour(1000 + i * 7777, STAGES[i].color));
+    for (let m = 0; m < 2; m++) {
+      const table = STAGE_TABLES[m];
+      for (let i = 0; i < table.length; i++) {
+        const stars = (m === 0 && (i === 2 || i === 5)) || (m === 1 && i === 4);
+        this.bgBase[m].push(genBase(stars, table[i].color, m * 31 + i));
+        this.bgContour[m].push(genContour(1000 + (m * 11 + i) * 7777, table[i].color));
+      }
     }
-    this.bgBase.push(genBase(6, '#8fa0ff'));
-    this.bgContour.push(genContour(424242, '#9fb0ff'));
+    this.bgTitle = genBase(true, '#8fa0ff', 99);
+    this.bgTitleContour = genContour(424242, '#9fb0ff');
     this.vignette = genVignette(0, 0, 0, 0.62);
     this.dangerVig = genVignette(255, 20, 60, 0.7);
     if (document.fonts && document.fonts.ready) {
@@ -477,13 +517,22 @@ export class Engine {
   }
 
   // ═══ Public control ══════════════════════════════════════
+  /** 難易度・モードに応じたステージ表 */
+  stages(): readonly StageDef[] {
+    return STAGE_TABLES[this.gameType];
+  }
+
+  nStages(): number {
+    return this.gameType === 0 ? N_STAGES : N_STAGES_JUMP;
+  }
+
   toTitle(): void {
     this.clearAll();
     this.mode = 'attract';
     this.modeT = 0;
     this.bossVisible = false;
     this.playerAlive = false;
-    this.bgIdx = 6;
+    this.bgIdx = 0;
     this.paused = false;
     this.L = 1;
     this.sp = 1;
@@ -493,10 +542,12 @@ export class Engine {
     this.audio.bgmStart(6, 0);
   }
 
-  startRun(d: number, s: number, hi: number): void {
+  /** 難易度をひとつ選び、ステージ1から final までを通しで開始する */
+  startRun(m: ModeId, d: number, hi: number): void {
     this.audio.init();
+    this.gameType = m;
     this.diff = d;
-    this.startStage = s;
+    this.startStage = 0;
     this.score = 0;
     this.hi = hi;
     this.graze = 0;
@@ -510,19 +561,23 @@ export class Engine {
     this.ended = false;
     this.clearAll();
     this.plX = this.plPX = W / 2;
-    this.plY = this.plPY = H - 70;
+    this.plY = this.plPY = m === 0 ? H - 70 : H - 150;
+    this.vy = 0;
     for (let i = 0; i < 10; i++) { this.trailX[i] = this.plX; this.trailY[i] = this.plY; }
     this.playerAlive = true;
     this.invuln = 0;
     this.deathTimer = -1;
     this.paused = false;
-    this.beginStage(s);
+    this.awaitJump = m === 1;
+    this.beginStage(0);
   }
 
   setPaused(p: boolean): void {
     if (!this.isPlaying()) return;
     this.paused = p;
     this.kL = this.kR = this.kU = this.kD = this.kF = false;
+    this.kJ = false;
+    this.jumpHoldT = 0;
     this.dragId = -1;
     this.activePointers = 0;
     if (p) this.audio.suspend();
@@ -561,6 +616,39 @@ export class Engine {
 
   aim(x: number, y: number): number {
     return Math.atan2(this.plY - y, this.plX - x);
+  }
+
+  /** 弾速：基準速度 × spdMul(L)（難度係数の唯一の入口） */
+  /** キー割り当てを差し替える（設定画面から呼ぶ） */
+  setKeys(km: KeyMap): void {
+    this.keys = { ...km };
+    this.keyLookup.clear();
+    for (const [action, code] of Object.entries(km)) {
+      if (code) this.keyLookup.set(code, action as KeyAction);
+    }
+  }
+
+  getKeys(): KeyMap {
+    return { ...this.keys };
+  }
+
+  /** code に対応する操作（移動の WASD 補助を含む） */
+  private actionOf(code: string): KeyAction | undefined {
+    return this.keyLookup.get(code) ?? WASD_ALIAS[code];
+  }
+
+  v(base: number): number {
+    return base * this.sp;
+  }
+
+  /** 弾数：基準本数 × denMul(L) × cal */
+  n(base: number): number {
+    return Math.max(1, Math.round(base * this.dn * this.cal));
+  }
+
+  /** 壁・帯：本数を増やせない形なので、間隔そのものを denMul と cal で割る */
+  fw(k: number, base: number): boolean {
+    return this.tick(k, base / Math.max(0.2, this.dn * this.cal));
   }
 
   spawn(x: number, y: number, a: number, s: number, type: number, col: number): number {
@@ -663,6 +751,9 @@ export class Engine {
     this.ln = 0;
     this.pn = 0;
     this.qn = 0;
+    this.vy = 0;
+    this.jumpReq = false;
+    this.jumpHoldT = 0;
     this.cancelR = -1;
     this.timeStop = 0;
     this.wellOn = false;
@@ -679,6 +770,7 @@ export class Engine {
 
   // ═══ Flow ════════════════════════════════════════════════
   private beginStage(s: number): void {
+    const table = this.stages();
     this.stage = s;
     this.mode = 'intro';
     this.modeT = 0;
@@ -691,11 +783,12 @@ export class Engine {
     this.petals = false;
     this.audio.bgmStart(s, 0);
     this.audio.setIntensity(0);
-    this.events.onStageReached(this.diff, s);
+    this.events.onStageReached(this.gameType, this.diff, s);
+    void table;
   }
 
   private beginPhase(p: number): void {
-    const st = STAGES[this.stage];
+    const st = this.stages()[this.stage];
     this.phase = p;
     this.mode = 'phase';
     this.modeT = 0;
@@ -715,14 +808,15 @@ export class Engine {
     this.phaseMissed = false;
     this.phaseBombed = false;
     this.updateLevel();
-    this.pattern = PATTERNS[st.phases[p].id] ?? null;
+    this.cal = PATTERN_CAL[st.phases[p].id] ?? 1;
+    this.pattern = (this.gameType === 1 ? PATTERNS_JUMP : PATTERNS)[st.phases[p].id] ?? null;
     if (this.pattern && this.pattern.init) this.pattern.init(this, this.L);
     this.cutinT = 0;
     this.ctx.font = FONT_PHASE;
     this.phaseNameW = this.ctx.measureText(st.phases[p].name).width;
     this.audio.cutin();
     const last = p === st.phases.length - 1;
-    this.audio.setIntensity(this.stage === N_STAGES - 1 && last ? 3 : p === 0 ? 1 : 2);
+    this.audio.setIntensity(this.stage === this.nStages() - 1 && last ? 3 : p === 0 ? 1 : 2);
   }
 
   private updateLevel(): void {
@@ -753,11 +847,11 @@ export class Engine {
     this.flash = 0.35;
     this.flashRed = false;
     this.shake = 6;
-    for (let k = 0; k < 3; k++) this.addP(K_RING, this.bossX, this.bossY, 6 + k * 3, 0, 40, 10, STAGES[this.stage].colorIdx);
+    for (let k = 0; k < 3; k++) this.addP(K_RING, this.bossX, this.bossY, 6 + k * 3, 0, 40, 10, this.stages()[this.stage].colorIdx);
   }
 
   private nextAfterGap(): void {
-    const st = STAGES[this.stage];
+    const st = this.stages()[this.stage];
     if (this.phase + 1 < st.phases.length) {
       this.beginPhase(this.phase + 1);
       return;
@@ -766,9 +860,9 @@ export class Engine {
     this.modeT = 0;
     this.stageBonus = (this.lives * 50000 + this.bombs * 20000) * (this.diff + 1) * (this.stage + 1);
     this.score += this.stageBonus;
-    this.burst(this.bossX, this.bossY, 140, STAGES[this.stage].colorIdx, 9, 2.2);
+    this.burst(this.bossX, this.bossY, 140, st.colorIdx, 9, 2.2);
     this.burst(this.bossX, this.bossY, 60, C_WHITE, 12, 1.4);
-    for (let k = 0; k < 5; k++) this.addP(K_RING, this.bossX, this.bossY, 4 + k * 2.5, 0, 50 + k * 6, 6, k & 1 ? C_WHITE : STAGES[this.stage].colorIdx);
+    for (let k = 0; k < 5; k++) this.addP(K_RING, this.bossX, this.bossY, 4 + k * 2.5, 0, 50 + k * 6, 6, k & 1 ? C_WHITE : st.colorIdx);
     this.shake = 18;
     this.flash = 0.85;
     this.flashRed = false;
@@ -776,7 +870,7 @@ export class Engine {
     this.audio.stageClear();
     this.audio.setIntensity(0);
     this.moveBoss(W / 2, -160, 150);
-    this.events.onStageReached(this.diff, this.stage + 1);
+    this.events.onStageReached(this.gameType, this.diff, this.stage + 1);
   }
 
   private emitEnd(cleared: boolean): void {
@@ -784,9 +878,10 @@ export class Engine {
     this.ended = true;
     this.events.onEnd({
       cleared,
+      mode: this.gameType,
       difficulty: this.diff,
       startStage: this.startStage,
-      stageReached: cleared ? N_STAGES : this.stage,
+      stageReached: cleared ? this.nStages() : this.stage,
       score: this.score,
       graze: this.graze,
       misses: this.misses,
@@ -838,11 +933,12 @@ export class Engine {
       }
       return;
     }
-    this.bombs = Math.max(this.bombs, DIFFS[this.diff].bombs);
     this.invuln = 180;
     this.gauge = Math.floor(this.gauge * 0.5);
     this.plX = this.plPX = W / 2;
-    this.plY = this.plPY = H - 60;
+    this.plY = this.plPY = this.gameType === 0 ? H - 60 : H - 150;
+    this.vy = 0;
+    for (let k = 0; k < 10; k++) { this.trailX[k] = this.plX; this.trailY[k] = this.plY; }
     this.addP(K_RING, this.plX, this.plY, -1.2, 0, 40, 60, C_PINK);
   }
 
@@ -874,10 +970,14 @@ export class Engine {
     this.audio.graze();
     if (this.gauge >= GAUGE_MAX) {
       this.gauge = 0;
-      if (this.bombs < 7) this.bombs++;
       this.addPop(this.plX, this.plY - 40, 0, POP_MAA);
-      this.addPop(this.plX, this.plY - 22, 0, POP_EXTEND);
-      this.audio.extend();
+      if (this.bombs < DIFFS[this.diff].bombs) {
+        this.bombs++;
+        this.addPop(this.plX, this.plY - 22, 0, POP_EXTEND);
+        this.audio.extend();
+      } else {
+        this.score += 5000 * (this.diff + 1);
+      }
     }
   }
 
@@ -924,6 +1024,14 @@ export class Engine {
       return;
     }
     this.stepStill = false;
+    // 無限ジャンプ：最初のジャンプまで時間は動かない
+    if (this.awaitJump) {
+      if (!this.jumpReq) {
+        this.stepStill = true;
+        return;
+      }
+      this.awaitJump = false;
+    }
     // ゲームオーバー時はスローモーション
     if (this.mode === 'over' && (this.globalT & 1) === 1) {
       this.modeT++;
@@ -950,7 +1058,7 @@ export class Engine {
         break;
       case 'stageclear':
         if (this.modeT >= CLEAR_T) {
-          if (this.stage + 1 < N_STAGES) this.beginStage(this.stage + 1);
+          if (this.stage + 1 < this.nStages()) this.beginStage(this.stage + 1);
           else {
             this.mode = 'ending';
             this.modeT = 0;
@@ -1003,6 +1111,7 @@ export class Engine {
       if (this.bombReq && this.bombs > 0) this.doBomb();
       else if (--this.deathTimer < 0) this.die();
       this.bombReq = false;
+      this.jumpReq = false;
       return;
     }
     if (this.bombReq) {
@@ -1010,12 +1119,32 @@ export class Engine {
       if (this.mode !== 'ending') this.doBomb();
     }
     this.focus = this.kF;
-    let dx = (this.kR ? 1 : 0) - (this.kL ? 1 : 0);
-    let dy = (this.kD ? 1 : 0) - (this.kU ? 1 : 0);
-    if (dx !== 0 && dy !== 0) { dx *= 0.7071; dy *= 0.7071; }
-    const v = this.focus ? SLOW : FAST;
-    let mx = dx * v;
-    let my = dy * v;
+    let mx = 0;
+    let my = 0;
+    if (this.gameType === 0) {
+      let dx = (this.kR ? 1 : 0) - (this.kL ? 1 : 0);
+      let dy = (this.kD ? 1 : 0) - (this.kU ? 1 : 0);
+      if (dx !== 0 && dy !== 0) { dx *= 0.7071; dy *= 0.7071; }
+      const v = this.focus ? SLOW : FAST;
+      mx = dx * v;
+      my = dy * v;
+    } else {
+      // 無限ジャンプ：左右のみ。上下は重力とジャンプで決まる
+      mx = ((this.kR ? 1 : 0) - (this.kL ? 1 : 0)) * (this.focus ? HJ_SLOW : HJ_FAST);
+      if (this.jumpReq) {
+        // 押した瞬間に飛び始める（押し続けた分だけ伸びる／空中でも可）
+        this.jumpReq = false;
+        this.vy = -JUMP_V0;
+        this.jumpHoldT = JUMP_HOLD;
+      } else if (this.kJ && this.jumpHoldT > 0) {
+        // 押し続けた分だけ伸びる（上限あり＝跳躍力は高くない）
+        this.vy -= JUMP_THRUST;
+        this.jumpHoldT--;
+      }
+      this.vy += GRAV;
+      if (this.vy > JUMP_VMAX) this.vy = JUMP_VMAX;
+      my = this.vy;
+    }
     let ddx = this.dragDX;
     let ddy = this.dragDY;
     this.dragDX = 0;
@@ -1023,14 +1152,32 @@ export class Engine {
     if (ddx > 24) ddx = 24; else if (ddx < -24) ddx = -24;
     if (ddy > 24) ddy = 24; else if (ddy < -24) ddy = -24;
     mx += ddx;
-    my += ddy;
+    if (this.gameType === 0) my += ddy;
     this.moving = mx !== 0 || my !== 0;
     let x = this.plX + mx;
     let y = this.plY + my;
     if (x < 8) x = 8; else if (x > W - 8) x = W - 8;
-    if (y < 14) y = 14; else if (y > H - 12) y = H - 12;
+    if (this.gameType === 0) {
+      if (y < 14) y = 14; else if (y > H - 12) y = H - 12;
+    } else {
+      // 地面はない。上端でだけ止まる（下は落ちていく）
+      if (y < J_TOP) { y = J_TOP; if (this.vy < 0) this.vy = 0; }
+    }
     this.plX = x;
     this.plY = y;
+    // 落下＝画面外。1機失って初期位置から（無敵時間は通常ミスと同じ）
+    if (this.gameType === 1 && this.deathTimer < 0 && y > J_FALL) {
+      if (this.invuln > 0) {
+        // 無敵時間中は落ちても消えない：初期位置へ戻すだけ
+        this.plX = this.plPX = W / 2;
+        this.plY = this.plPY = H - 150;
+        this.vy = -JUMP_V0;
+        for (let k = 0; k < 10; k++) { this.trailX[k] = this.plX; this.trailY[k] = this.plY; }
+      } else {
+        this.die();
+      }
+      return;
+    }
     if (this.invuln > 0) this.invuln--;
     this.trailHead = (this.trailHead + 1) % 10;
     this.trailX[this.trailHead] = x;
@@ -1102,6 +1249,7 @@ export class Engine {
             if (this.b0[i] > 0) {
               if ((x < 4 && c < 0) || (x > W - 4 && c > 0)) { a = Math.PI - a; this.b0[i]--; }
               else if (y < 4 && sn < 0) { a = -a; this.b0[i]--; }
+              else if (this.gameType === 1 && y > H - 6 && sn > 0) { a = -a; this.b0[i]--; }
             }
             break;
           }
@@ -1304,7 +1452,7 @@ export class Engine {
     const r2 = this.cancelR * this.cancelR;
     const cx = this.cancelX;
     const cy = this.cancelY;
-    const petal = this.stage === N_STAGES - 1 && this.mode !== 'attract';
+    const petal = this.stage === this.nStages() - 1 && this.mode !== 'attract';
     let i = 0;
     while (i < this.bn) {
       const dx = this.bx[i] - cx;
@@ -1413,17 +1561,27 @@ export class Engine {
 
   // ═══ Input ═══════════════════════════════════════════════
   private onKeyDown = (e: KeyboardEvent): void => {
+    if (this.inputLocked) return;
+    const act = this.actionOf(e.code);
     let handled = true;
-    switch (e.code) {
-      case 'ArrowLeft': case 'KeyA': this.kL = true; break;
-      case 'ArrowRight': case 'KeyD': this.kR = true; break;
-      case 'ArrowUp': case 'KeyW': this.kU = true; break;
-      case 'ArrowDown': case 'KeyS': this.kD = true; break;
-      case 'ShiftLeft': case 'ShiftRight': this.kF = true; break;
-      case 'KeyX': case 'Space': case 'KeyC':
+    switch (act) {
+      case 'left': this.kL = true; break;
+      case 'right': this.kR = true; break;
+      case 'up': this.kU = true; break;
+      case 'down': this.kD = true; break;
+      case 'focus': this.kF = true; break;
+      case 'bomb':
         if (!e.repeat && !this.paused) this.bombReq = true;
         break;
-      case 'Escape': case 'KeyP':
+      case 'jump':
+        if (this.gameType === 1) {
+          if (!e.repeat) { this.jumpReq = true; this.jumpHoldT = JUMP_HOLD; }
+          this.kJ = true;
+        } else {
+          handled = false;
+        }
+        break;
+      case 'pause':
         if (!e.repeat && this.isPlaying() && this.mode !== 'over' && !this.ended) {
           const p = !this.paused;
           this.setPaused(p);
@@ -1437,17 +1595,25 @@ export class Engine {
   };
 
   private onKeyUp = (e: KeyboardEvent): void => {
-    switch (e.code) {
-      case 'ArrowLeft': case 'KeyA': this.kL = false; break;
-      case 'ArrowRight': case 'KeyD': this.kR = false; break;
-      case 'ArrowUp': case 'KeyW': this.kU = false; break;
-      case 'ArrowDown': case 'KeyS': this.kD = false; break;
-      case 'ShiftLeft': case 'ShiftRight': this.kF = false; break;
+    const act = this.actionOf(e.code);
+    switch (act) {
+      case 'left': this.kL = false; break;
+      case 'right': this.kR = false; break;
+      case 'up': this.kU = false; break;
+      case 'down': this.kD = false; break;
+      case 'focus': this.kF = false; break;
+      case 'jump':
+        if (this.gameType === 1) { this.kJ = false; this.jumpHoldT = 0; }
+        break;
+      default:
+        break;
     }
   };
 
   private onBlur = (): void => {
     this.kL = this.kR = this.kU = this.kD = this.kF = false;
+    this.kJ = false;
+    this.jumpHoldT = 0;
   };
 
   private onVis = (): void => {
@@ -1462,6 +1628,11 @@ export class Engine {
     this.audio.init();
     this.activePointers++;
     if (this.activePointers >= 2) this.bombReq = true;
+    if (this.gameType === 1 && this.activePointers === 1) {
+      this.jumpReq = true;
+      this.kJ = true;
+      this.jumpHoldT = JUMP_HOLD;
+    }
     if (this.dragId === -1) {
       this.dragId = e.pointerId;
       this.lastPX = e.clientX;
@@ -1492,6 +1663,7 @@ export class Engine {
   private onPointerUp = (e: PointerEvent): void => {
     this.activePointers = Math.max(0, this.activePointers - 1);
     if (e.pointerId === this.dragId) this.dragId = -1;
+    if (this.activePointers === 0) { this.kJ = false; this.jumpHoldT = 0; }
   };
 
   // ═══ Render ══════════════════════════════════════════════
@@ -1553,10 +1725,12 @@ export class Engine {
 
   private drawBg(): void {
     const c = this.ctx;
-    c.drawImage(this.bgBase[this.bgIdx], 0, 0, W, H);
+    const title = this.mode === 'attract';
+    const base = title ? this.bgTitle : this.bgBase[this.gameType][this.bgIdx];
+    const cv = title ? this.bgTitleContour : this.bgContour[this.gameType][this.bgIdx];
+    c.drawImage(base, 0, 0, W, H);
     const off = this.bgScroll;
     c.globalAlpha = 0.95;
-    const cv = this.bgContour[this.bgIdx];
     c.drawImage(cv, 0, off - BGH, W, BGH);
     c.drawImage(cv, 0, off, W, BGH);
     c.globalAlpha = 1;
@@ -1675,7 +1849,7 @@ export class Engine {
 
   private drawBoss(alpha: number): void {
     const c = this.ctx;
-    const st = STAGES[this.stage];
+    const st = this.stages()[this.stage];
     const x = this.bossPX + (this.bossX - this.bossPX) * alpha;
     const y = this.bossPY + (this.bossY - this.bossPY) * alpha;
     const col = this.mode === 'attract' ? '#ffffff' : st.color;
@@ -2048,7 +2222,7 @@ export class Engine {
 
   private drawCutin(): void {
     const c = this.ctx;
-    const st = STAGES[this.stage];
+    const st = this.stages()[this.stage];
     const t = this.cutinT;
     const inE = t < 16 ? easeOut(t / 16) : 1;
     const outE = t > 86 ? (t - 86) / 24 : 0;
@@ -2091,7 +2265,7 @@ export class Engine {
     c.shadowBlur = 0;
     c.font = FONT_CUT_SUB;
     c.fillStyle = 'rgba(255,255,255,0.7)';
-    c.fillText(BOSS_HUD[this.stage], W / 2 + slide * 0.6, yc + 32);
+    c.fillText(BOSS_HUD[this.gameType][this.stage], W / 2 + slide * 0.6, yc + 32);
     c.globalAlpha = 1;
   }
 
@@ -2119,7 +2293,7 @@ export class Engine {
 
   private drawHUD(): void {
     const c = this.ctx;
-    const st = STAGES[this.stage];
+    const st = this.stages()[this.stage];
     const d = DIFFS[this.diff];
     c.globalAlpha = 1;
     c.textBaseline = 'alphabetic';
@@ -2165,7 +2339,24 @@ export class Engine {
     c.fillText('難度係数 L', W - 50, 36);
     this.drawNum(this.digits, this.L, W - 10, 26, 13, 1, 2);
     c.textAlign = 'left';
-    c.fillText(STAGE_LABELS[this.stage], 10, 58);
+    c.fillText(MODE_HUD[this.gameType], 10, 58);
+    c.fillText(stageLabel(this.nStages(), this.stage), 10, 72);
+    // 最初のジャンプ待ち：押すキーだけを示す
+    if (this.awaitJump) {
+      const blink = (this.globalT >> 4) & 1;
+      c.textAlign = 'center';
+      c.font = FONT_HUD_M;
+      c.fillStyle = blink ? 'rgba(255,255,255,0.95)' : 'rgba(94,203,255,0.95)';
+      c.fillText('SPACE', W / 2, H - 96);
+      c.fillStyle = 'rgba(255,255,255,0.35)';
+      c.beginPath();
+      c.moveTo(W / 2, H - 74);
+      c.lineTo(W / 2 - 7, H - 84);
+      c.lineTo(W / 2 + 7, H - 84);
+      c.closePath();
+      c.fill();
+      c.textAlign = 'left';
+    }
     // 残機
     const by = H - 14;
     for (let k = 0; k < this.lives && k < 9; k++) {
@@ -2214,7 +2405,7 @@ export class Engine {
 
   private drawIntro(): void {
     const c = this.ctx;
-    const st = STAGES[this.stage];
+    const st = this.stages()[this.stage];
     const t = this.modeT;
     const a = Math.min(1, t / 20) * Math.min(1, (INTRO - t) / 25);
     if (a <= 0) return;
@@ -2229,7 +2420,7 @@ export class Engine {
     c.textBaseline = 'middle';
     c.font = FONT_STAGE;
     c.fillStyle = st.color;
-    c.fillText(STAGE_LABELS[this.stage], W / 2, 234);
+    c.fillText(stageLabel(this.nStages(), this.stage), W / 2, 234);
     c.font = FONT_TITLE;
     c.fillStyle = '#ffffff';
     c.shadowColor = st.color;
@@ -2238,7 +2429,7 @@ export class Engine {
     c.shadowBlur = 0;
     c.font = FONT_HUD_M;
     c.fillStyle = 'rgba(255,255,255,0.7)';
-    c.fillText(BOSS_HUD[this.stage], W / 2, 302);
+    c.fillText(BOSS_HUD[this.gameType][this.stage], W / 2, 302);
     const wipe = Math.max(0, Math.min(1, (t - 45) / 70));
     c.save();
     c.beginPath();
@@ -2260,7 +2451,7 @@ export class Engine {
     c.textBaseline = 'middle';
     c.font = FONT_BANNER;
     c.fillStyle = '#ffffff';
-    c.shadowColor = STAGES[this.stage].color;
+    c.shadowColor = this.stages()[this.stage].color;
     c.shadowBlur = 18;
     c.fillText('✝本質回避✝', W / 2, 250);
     c.shadowBlur = 0;
@@ -2290,7 +2481,7 @@ export class Engine {
     c.textBaseline = 'middle';
     c.font = FONT_BANNER;
     c.fillStyle = '#ffffff';
-    c.shadowColor = STAGES[this.stage].color;
+    c.shadowColor = this.stages()[this.stage].color;
     c.shadowBlur = 20;
     c.fillText('STAGE CLEAR', W / 2, 250);
     c.shadowBlur = 0;
@@ -2332,11 +2523,12 @@ export class Engine {
     c.textAlign = 'center';
     c.textBaseline = 'middle';
     c.font = FONT_END;
-    for (let i = 0; i < ENDING_LINES.length; i++) {
+    const lines = ENDING_LINES_ALL[this.gameType];
+    for (let i = 0; i < lines.length; i++) {
       const a = Math.max(0, Math.min(1, (t - 40 - i * 70) / 40));
       c.globalAlpha = a;
       c.fillStyle = i === 2 ? '#ffd3ea' : '#ffffff';
-      c.fillText(ENDING_LINES[i], W / 2, 220 + i * 40);
+      c.fillText(lines[i], W / 2, 220 + i * 40);
     }
     const a2 = Math.max(0, Math.min(1, (t - 360) / 50));
     c.globalAlpha = a2;

@@ -64,6 +64,23 @@ export const F_DISPLAY = '"Dela Gothic One", "Hiragino Sans", "Yu Gothic", "Meir
 export const F_UI = '"Zen Kaku Gothic New", "Hiragino Sans", "Yu Gothic", "Meiryo", sans-serif';
 export const F_MINCHO = '"Shippori Mincho B1", "Hiragino Mincho ProN", "Yu Mincho", serif';
 
+// ── Modes ──────────────────────────────────────────────────
+/** 0: 回避弾幕（平面4方向移動） / 1: 無限ジャンプ（重力＋ジャンプ移動） */
+export type ModeId = 0 | 1;
+export const N_MODES = 2;
+
+export interface ModeDef {
+  readonly id: ModeId;
+  readonly name: string;
+  readonly sub: string;
+  readonly color: string;
+}
+
+export const MODES: readonly ModeDef[] = [
+  { id: 0, name: '回避弾幕', sub: 'EVASION', color: '#ff5c86' },
+  { id: 1, name: '無限ジャンプ', sub: 'INFINITE JUMP', color: '#5ecbff' },
+];
+
 // ── Difficulty ─────────────────────────────────────────────
 export type DiffId = 0 | 1 | 2 | 3;
 
@@ -72,37 +89,108 @@ export interface DifficultyDef {
   readonly name: string;
   readonly label: string;
   readonly hensachi: number;
+  /** 残機（全難易度共通の5機） */
   readonly lives: number;
+  /** 「は？」（全難易度共通で5回） */
   readonly bombs: number;
   readonly color: string;
-  readonly desc: string;
 }
 
 export const DIFFS: readonly DifficultyDef[] = [
-  { id: 0, name: '北棟', label: 'EASY', hensachi: 50, lives: 5, bombs: 3, color: '#5eead4', desc: 'コーンスープが三ヶ月補充されない側。まずは✝本質✝の気配に慣れる。' },
-  { id: 1, name: '理数科', label: 'NORMAL', hensachi: 60, lives: 4, bombs: 3, color: '#fbbf24', desc: 'えんじのネクタイ。三年間、同じ四十人。標準的な✝本質✝濃度。' },
-  { id: 2, name: '内進', label: 'HARD', hensachi: 70, lives: 3, bombs: 2, color: '#f472b6', desc: '紺のネクタイ。偏差値十の壁の向こう側。効率では避けきれない。' },
-  { id: 3, name: '数理零', label: 'LUNATIC', hensachi: 85, lives: 3, bombs: 2, color: '#a78bfa', desc: '全科目学年首席。「面白い」としか言わない者だけが立てる領域。' },
+  { id: 0, name: '普通科', label: 'EASY', hensachi: 50, lives: 5, bombs: 5, color: '#5eead4' },
+  { id: 1, name: '理数科', label: 'NORMAL', hensachi: 60, lives: 5, bombs: 5, color: '#fbbf24' },
+  { id: 2, name: '内進', label: 'HARD', hensachi: 70, lives: 5, bombs: 5, color: '#f472b6' },
+  { id: 3, name: '数理零', label: 'LUNATIC', hensachi: 85, lives: 5, bombs: 5, color: '#a78bfa' },
 ];
 
+export const LIVES = 5;
+export const BOMBS = 5;
+
 /**
- * 難度係数 L — 全ゲーム内で「厳密に単調増加」する唯一のスカラー。
- *   L = d + 0.13·s + 0.032·p + 0.028·f   (f: フェーズ内経過率 0..1)
- * 検証:
- *   ・フェーズ内最大増分 0.028 < フェーズ刻み 0.032
- *   ・ステージ内最大増分 3·0.032 + 0.028 = 0.124 < ステージ刻み 0.13
- *   ・難易度内最大 5·0.13 + 0.124 = 0.774 < 難易度刻み 1.0
- * ⇒ (d,s,p,f) の辞書式順序と L の大小が完全一致する。
+ * 難度係数 L — ゲーム全体で「弾幕の強さ」を決める唯一のスカラー。
+ *
+ *   L = d + 0.16·s + 0.04·p + 0.028·f        (f: フェーズ内経過率 0..1)
+ *
+ * 辞書式順序 (d,s,p,f) と L の大小が完全一致するための検証：
+ *   ・フェーズ内最大増分 0.028   < フェーズ刻み 0.04
+ *   ・最長ステージ（4フェーズ）でも 3·0.04 + 0.028 = 0.148 < ステージ刻み 0.16
+ *     → ステージが変わると必ず強くなる（段の内部で先に強くなりすぎない）
+ *   ・難易度内の最大 5·0.16 + 3·0.04 + 0.028 = 0.948 < 難易度刻み 1.0
+ *     → 易しい難易度の final より、次の難易度の stage 1 の方が必ず強い
+ *
+ * つまり run の中ではフェーズごとに +2.4%、難易度ひとつで平均 2.3 倍。
+ * 各フェーズの実測強度は K·S(L) に一致する（tools/measure.ts で検証）。
+ *
+ * そして「係数と実際の弾幕の強さ」を一致させるため、弾幕の総量は
+ * 下の spdMul / denMul / rateMul の積だけで表される（弾幕強度 S）。
+ * 各パターンは基準値にこの3つを掛けるだけにする（L の直接参照は禁止）。
  */
 export function levelOf(d: number, s: number, p: number, f: number): number {
-  return d + s * 0.13 + p * 0.032 + f * 0.028;
+  return d + s * 0.16 + p * 0.04 + f * 0.028;
 }
-/** 弾速倍率 */
-export const spdMul = (L: number): number => 0.82 + 0.15 * L;
-/** 弾数倍率 */
-export const denMul = (L: number): number => 0.62 + 0.26 * L;
-/** 発射頻度倍率 */
-export const rateMul = (L: number): number => 0.75 + 0.25 * L;
+
+/** 弾速倍率  : 0.88 → 1.35 (L=0 → 3.948) */
+export const spdMul = (L: number): number => 0.88 + 0.12 * L;
+/** 弾数倍率  : 0.60 → 1.59 */
+export const denMul = (L: number): number => 0.60 + 0.25 * L;
+/** 発射頻度倍率 : 0.68 → 1.67 */
+export const rateMul = (L: number): number => 0.68 + 0.25 * L;
+/** 弾幕強度 S = 弾数 × 弾速 × 頻度（係数と難易度の対応を保証する量） */
+export const intensityOf = (L: number): number => spdMul(L) * denMul(L) * rateMul(L);
+/** 単発弾の基準速度（論理px/frame）。全パターンはこの定数に倍率を掛ける。 */
+export const BASE_SPD = 1.9;
+
+// ── パターン別 強度較正 ────────────────────────────────────
+/**
+ * 各パターンの「基準強度」補正係数。
+ * 設計規則（data.ts 冒頭の3倍率）どおりに書かれたパターンでも、
+ * 形（環・壁・螺旋…）による基礎強度の差が残るため、ここで 1.00 に揃える。
+ * 値は tools/measure.ts の実測（弾幕強度 T / 理論値 K·S(L)）から決定する。
+ *   1.00 より大きい = その形は弱めに出るので本数／頻度を増やす
+ */
+export const PATTERN_CAL: Record<string, number> = {
+  s1p1: 0.96,
+  s1p2: 1.01,
+  s1p3: 0.93,
+  s2p1: 0.94,
+  s2p2: 1.03,
+  s2p3: 0.85,
+  s2p4: 1.20,
+  s3p1: 0.83,
+  s3p2: 0.88,
+  s3p3: 1.12,
+  s4p1: 0.92,
+  s4p2: 1.10,
+  s4p3: 0.95,
+  s5p1: 1.05,
+  s5p2: 1.02,
+  s5p3: 0.81,
+  s6p1: 1.11,
+  s6p2: 0.94,
+  s6p3: 1.15,
+  s6p4: 0.92,
+  // 無限ジャンプモード（j*）— ステージ側の基準値から実測で較正
+  j1p1: 1.11,
+  j1p2: 3.24,
+  j1p3: 2.56,
+  j2p1: 1.22,
+  j2p2: 1.19,
+  j2p3: 1.26,
+  j3p1: 1.71,
+  j3p2: 1.10,
+  j3p3: 1.39,
+  j4p1: 1.40,
+  j4p2: 1.24,
+  j4p3: 1.65,
+  j5p1: 1.28,
+  j5p2: 1.00,
+  j5p3: 1.87,
+  j5p4: 1.80,
+};
+
+export const MAX_L = levelOf(3, 5, 3, 1);
+export const INTENSITY_AT_L1 = intensityOf(1);
+export const INTENSITY_MAX = intensityOf(MAX_L);
 
 // ── Stages ─────────────────────────────────────────────────
 export interface PhaseDef {
@@ -121,6 +209,7 @@ export interface StageDef {
   readonly phases: readonly PhaseDef[];
 }
 
+/** モード0: 回避弾幕 — 一年目（両馬・塀・寺地・櫻・倉石・✝本質✝） */
 export const STAGES: readonly StageDef[] = [
   {
     title: '✝本質✝の発生', boss: '両馬二郎', glyph: '両', color: '#ff8a4a', colorIdx: C_ORANGE,
@@ -180,16 +269,76 @@ export const STAGES: readonly StageDef[] = [
   },
 ];
 
+/** モード1: 無限ジャンプ — 二年目〜三年目（倉石・召野・翠湖・球技大会・沈黙） */
+export const STAGES_JUMP: readonly StageDef[] = [
+  {
+    title: '倉石暁、降臨', boss: '倉石暁', glyph: '倉', color: '#b86bff', colorIdx: C_VIOLET,
+    quote: '「僕は信徒です。教祖とは違います」',
+    phases: [
+      { id: 'j1p1', name: '信徒「教祖に会えた」', dur: 26 },
+      { id: 'j1p2', name: 'ノート「表紙に✝」', dur: 28 },
+      { id: 'j1p3', name: '教会「グレートチェーン」', dur: 30 },
+    ],
+  },
+  {
+    title: '人妻の✝本質✝', boss: '召野カイト', glyph: '召', color: '#ff6bd6', colorIdx: C_PINK,
+    quote: '「人妻の結婚指輪は、封印の刻印である」',
+    phases: [
+      { id: 'j2p1', name: '指輪「封印の刻印」', dur: 26 },
+      { id: 'j2p2', name: '英語「Take your time」', dur: 28 },
+      { id: 'j2p3', name: '玉砕「告白の意味」', dur: 30 },
+    ],
+  },
+  {
+    title: '翠湖十キロ', boss: '零', glyph: '零', color: '#4fd8ff', colorIdx: C_CYAN,
+    quote: '「見えないけど、ある」',
+    phases: [
+      { id: 'j3p1', name: '十キロ「加工なしの言葉」', dur: 28 },
+      { id: 'j3p2', name: '等高線「地形図の向こう」', dur: 28 },
+      { id: 'j3p3', name: '反射「湖面に映る✝本質✝」', dur: 30 },
+    ],
+  },
+  {
+    title: '球技大会、二点差', boss: '内進三年', glyph: '進', color: '#ff8a4a', colorIdx: C_ORANGE,
+    quote: '「背番号に✝本質✝はない。✝に✝本質✝がある」',
+    phases: [
+      { id: 'j4p1', name: 'スティール「読み」', dur: 28 },
+      { id: 'j4p2', name: '三点「用は済んだ」', dur: 28 },
+      { id: 'j4p3', name: '二点差「最後の十秒」', dur: 32 },
+    ],
+  },
+  {
+    title: '寺地星、沈黙する', boss: '寺地星', glyph: '星', color: '#dfe8ff', colorIdx: C_WHITE,
+    quote: '「わからないことが✝本質✝」',
+    phases: [
+      { id: 'j5p1', name: '切り抜き「十五万再生」', dur: 28 },
+      { id: 'j5p2', name: '一万人「コメント欄」', dur: 28 },
+      { id: 'j5p3', name: '沈黙「配信やめる」', dur: 26 },
+      { id: 'j5p4', name: '三十二人「おかえり」', dur: 36 },
+    ],
+  },
+];
+
+export const STAGE_TABLES: readonly (readonly StageDef[])[] = [STAGES, STAGES_JUMP];
 export const N_STAGES = STAGES.length;
+export const N_STAGES_JUMP = STAGES_JUMP.length;
 export const STAGE_LABELS: readonly string[] = ['STAGE 1', 'STAGE 2', 'STAGE 3', 'STAGE 4', 'STAGE 5', 'FINAL STAGE'];
 
-export function stageLevelRange(d: number, s: number): [number, number] {
-  const last = STAGES[s].phases.length - 1;
+/** ステージ表記（STAGE 1 … FINAL STAGE） */
+export function stageLabel(n: number, s: number): string {
+  return s === n - 1 ? 'FINAL STAGE' : STAGE_LABELS[s];
+}
+
+export function stageLevelRange(d: number, s: number, table: readonly StageDef[]): [number, number] {
+  const last = table[s].phases.length - 1;
   return [levelOf(d, s, 0, 0), levelOf(d, s, last, 1)];
 }
 
 /** ポップアップ文字列（事前確保：毎フレームの文字列生成ゼロ） */
-export const POP_TEXTS: readonly string[] = ['', 'は？', 'まあ…', '観測', '窓の外の五秒', '見てない', '面白い', '草', '✝本質✝', '「は？」+1'];
+export const POP_TEXTS: readonly string[] = [
+  '', 'は？', 'まあ…', '観測', '窓の外の五秒', '見てない', '面白い', '草', '✝本質✝', '「は？」+1',
+  '信徒', '封印', '見えないけどある', '二点差', 'おかえり',
+];
 export const POP_HA = 1;
 export const POP_MAA = 2;
 export const POP_KANSOKU = 3;
@@ -197,6 +346,10 @@ export const POP_WINDOW = 4;
 export const POP_MITENAI = 5;
 export const POP_OMOSHIROI = 6;
 export const POP_EXTEND = 9;
+export const POP_FUKUIN = 11;
+export const POP_MIENAI = 12;
+export const POP_TENSA = 13;
+export const POP_OKAERI = 14;
 
 export const COUNTDOWN: readonly string[] = ['', '1', '2', '3', '4', '5'];
 
@@ -207,21 +360,118 @@ export const ENDING_LINES: readonly string[] = [
   'それだけで十分だ。',
 ];
 
+export const ENDING_LINES_JUMP: readonly string[] = [
+  '一万人から、三十二人になった。',
+  '✝本質✝は、数じゃなかった。',
+  '見えないけど、ある。',
+  'わからないことが✝本質✝。',
+];
+
+export const ENDING_LINES_ALL: readonly (readonly string[])[] = [ENDING_LINES, ENDING_LINES_JUMP];
+
 // ── Save data ──────────────────────────────────────────────
-export interface Progress {
-  /** 各難易度で到達済みのステージ index（N_STAGES で全クリア） */
-  reached: number[];
-  hi: number[];
-  clears: number[];
+export interface RunStat {
+  /** 到達済みのステージ index（N で全ステージクリア） */
+  reached: number;
+  hi: number;
+  clears: number;
 }
 
-export const SAVE_KEY = 'honshitsu-danmaku-v1';
+export interface Progress {
+  /** [mode][difficulty] */
+  stats: RunStat[][];
+  /** モードごとのクリア済み難易度 */
+  cleared: boolean[][];
+}
+
+// ── キー割り当て ───────────────────────────────────────────
+//  操作は8つ。全部コード（KeyboardEvent.code）で保持し、保存も同じ表現。
+//  移動は WASD が常時使える補助キーとして別枠で効く（下の WASD_ALIAS）。
+export const KEY_ACTIONS = ['left', 'right', 'up', 'down', 'focus', 'bomb', 'jump', 'pause'] as const;
+export type KeyAction = (typeof KEY_ACTIONS)[number];
+
+export interface KeyDef {
+  readonly id: KeyAction;
+  readonly label: string;
+  /** この操作を使うモード（0:回避弾幕 1:無限ジャンプ）。空なら共通 */
+  readonly modes: readonly number[];
+}
+
+export const KEY_DEFS: readonly KeyDef[] = [
+  { id: 'left', label: '左', modes: [] },
+  { id: 'right', label: '右', modes: [] },
+  { id: 'up', label: '上', modes: [0] },
+  { id: 'down', label: '下', modes: [0] },
+  { id: 'focus', label: '低速（当たり判定が見える）', modes: [] },
+  { id: 'bomb', label: '「は？」', modes: [] },
+  { id: 'jump', label: 'ジャンプ', modes: [1] },
+  { id: 'pause', label: 'ポーズ', modes: [] },
+];
+
+export type KeyMap = Record<KeyAction, string>;
+
+export function defaultKeys(): KeyMap {
+  return {
+    left: 'ArrowLeft',
+    right: 'ArrowRight',
+    up: 'ArrowUp',
+    down: 'ArrowDown',
+    focus: 'ShiftLeft',
+    bomb: 'KeyZ',
+    jump: 'Space',
+    pause: 'Escape',
+  };
+}
+
+/** 移動の補助キー（常時有効。割り当てを変えても効く） */
+export const WASD_ALIAS: Readonly<Record<string, KeyAction>> = {
+  KeyA: 'left',
+  KeyD: 'right',
+  KeyW: 'up',
+  KeyS: 'down',
+};
+
+/** 表示用の短い名前 */
+export function codeLabel(code: string): string {
+  const fixed: Record<string, string> = {
+    ArrowLeft: '←', ArrowRight: '→', ArrowUp: '↑', ArrowDown: '↓',
+    ShiftLeft: 'Shift', ShiftRight: 'Shift',
+    ControlLeft: 'Ctrl', ControlRight: 'Ctrl',
+    AltLeft: 'Alt', AltRight: 'Alt',
+    Space: 'Space', Escape: 'Esc', Enter: 'Enter', Tab: 'Tab', Backspace: 'BS',
+    MetaLeft: 'Meta', MetaRight: 'Meta',
+    Semicolon: ';', Slash: '/', Period: '.', Comma: ',', Backquote: '`',
+    Minus: '-', Equal: '=', BracketLeft: '[', BracketRight: ']', Quote: "'",
+  };
+  if (fixed[code]) return fixed[code];
+  if (code.startsWith('Key')) return code.slice(3);
+  if (code.startsWith('Digit')) return code.slice(5);
+  if (code.startsWith('Numpad')) return `Num ${code.slice(6)}`;
+  return code;
+}
+
+export const KEYS_SAVE_KEY = 'honshitsu-danmaku-keys-v1';
+
+export const SAVE_KEY = 'honshitsu-danmaku-v2';
+export const OLD_SAVE_KEY = 'honshitsu-danmaku-v1';
+
+export function newStat(): RunStat {
+  return { reached: -1, hi: 0, clears: 0 };
+}
 
 export function defaultProgress(): Progress {
-  return { reached: [0, -1, -1, -1], hi: [0, 0, 0, 0], clears: [0, 0, 0, 0] };
+  return {
+    stats: [0, 1].map(() => [0, 1, 2, 3].map(() => newStat())),
+    cleared: [0, 1].map(() => [false, false, false, false]),
+  };
 }
 
-export function isDiffUnlocked(p: Progress, d: number): boolean {
+/** 難易度 d が遊べるか（1つ下の難易度を final まで通しでクリアで解禁） */
+export function isDiffUnlocked(p: Progress, m: number, d: number): boolean {
   if (d === 0) return true;
-  return p.reached[d - 1] >= N_STAGES;
+  return p.cleared[m][d - 1];
+}
+
+export function modeCleared(p: Progress, m: number): boolean {
+  return p.cleared[m][3];
 }
