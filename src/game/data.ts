@@ -51,6 +51,8 @@ export const B_SINE = 5;
 export const B_STEP = 6;
 export const B_SPLIT = 7;
 export const B_HOMING = 8;
+/** 床で跳ね、最後に床を転がる（無限ジャンプモード専用） */
+export const B_FLOOR = 9;
 
 // ── Flags ──────────────────────────────────────────────────
 export const FL_GRAZED = 1;
@@ -79,10 +81,10 @@ export interface DifficultyDef {
 }
 
 export const DIFFS: readonly DifficultyDef[] = [
-  { id: 0, name: '北棟', label: 'EASY', hensachi: 50, lives: 5, bombs: 3, color: '#5eead4', desc: 'コーンスープが三ヶ月補充されない側。まずは✝本質✝の気配に慣れる。' },
-  { id: 1, name: '理数科', label: 'NORMAL', hensachi: 60, lives: 4, bombs: 3, color: '#fbbf24', desc: 'えんじのネクタイ。三年間、同じ四十人。標準的な✝本質✝濃度。' },
-  { id: 2, name: '内進', label: 'HARD', hensachi: 70, lives: 3, bombs: 2, color: '#f472b6', desc: '紺のネクタイ。偏差値十の壁の向こう側。効率では避けきれない。' },
-  { id: 3, name: '数理零', label: 'LUNATIC', hensachi: 85, lives: 3, bombs: 2, color: '#a78bfa', desc: '全科目学年首席。「面白い」としか言わない者だけが立てる領域。' },
+  { id: 0, name: '普通科', label: 'EASY', hensachi: 50, lives: 5, bombs: 5, color: '#5eead4', desc: 'コーンスープが三ヶ月補充されない側。' },
+  { id: 1, name: '理数科', label: 'NORMAL', hensachi: 60, lives: 5, bombs: 5, color: '#fbbf24', desc: 'えんじのネクタイ。三年間、同じ四十人。' },
+  { id: 2, name: '内進', label: 'HARD', hensachi: 70, lives: 5, bombs: 5, color: '#f472b6', desc: '紺のネクタイ。偏差値十の壁の向こう側。' },
+  { id: 3, name: '数理零', label: 'LUNATIC', hensachi: 85, lives: 5, bombs: 5, color: '#a78bfa', desc: '全科目学年首席。「面白い」としか言わない。' },
 ];
 
 /**
@@ -183,9 +185,109 @@ export const STAGES: readonly StageDef[] = [
 export const N_STAGES = STAGES.length;
 export const STAGE_LABELS: readonly string[] = ['STAGE 1', 'STAGE 2', 'STAGE 3', 'STAGE 4', 'STAGE 5', 'FINAL STAGE'];
 
-export function stageLevelRange(d: number, s: number): [number, number] {
-  const last = STAGES[s].phases.length - 1;
-  return [levelOf(d, s, 0, 0), levelOf(d, s, last, 1)];
+// ── 無限ジャンプモード ───────────────────────────────────
+/**
+ * 床（論理px）。自機の接地時の中心 y であり、転がる弾の高さでもある。
+ * 描画上の地面線は FLOOR_Y + 12。
+ */
+export const FLOOR_Y = H - 60;
+/** 重力（px/frame²） */
+export const JUMP_G = 0.3;
+/** 最短ジャンプ初速（タップ） */
+export const JUMP_MIN = 4.2;
+/** 最長ジャンプ初速（14フレーム長押し） */
+export const JUMP_MAX = 8.4;
+/** 長押しの最大チャージフレーム */
+export const JUMP_CHARGE = 14;
+/** 空中ジャンプ初速（JUMP_AIR_CD 周期では高度を保てない＝ホバリング不可） */
+export const JUMP_AIR = 4.35;
+/** 空中ジャンプの再使用間隔（これ以上短いと高度を稼げてしまう） */
+export const JUMP_AIR_CD = 30;
+/** 左右移動速度 */
+export const RUN_FAST = 4.3;
+export const RUN_SLOW = 2.6;
+
+export interface ModeDef {
+  readonly id: 0 | 1;
+  readonly name: string;
+  readonly label: string;
+  readonly color: string;
+}
+
+export const MODES: readonly ModeDef[] = [
+  { id: 0, name: '回避弾幕', label: 'DANMAKU', color: '#ff5c7a' },
+  { id: 1, name: '無限ジャンプ', label: 'JUMP', color: '#4fd8ff' },
+];
+
+/** 無限ジャンプモード専用のステージ構成（回避弾幕モードとは別物） */
+export const JUMP_STAGES: readonly StageDef[] = [
+  {
+    title: '半歩ずれる', boss: '伊豆見', glyph: '伊', color: '#3dff9a', colorIdx: C_GREEN,
+    quote: '「たまには自分で何かやりたいなって」',
+    phases: [
+      { id: 'j1p1', name: '大喜利「お題が降ってくる」', dur: 26 },
+      { id: 'j1p2', name: '司会「自分でやりたい」', dur: 28 },
+      { id: 'j1p3', name: '回答「説明できたら✝本質✝じゃない」', dur: 30 },
+    ],
+  },
+  {
+    title: '窓の外を見ない', boss: '砂糖東洋', glyph: '砂', color: '#36e6ff', colorIdx: C_CYAN,
+    quote: '「見てない」',
+    phases: [
+      { id: 'j2p1', name: '充電切れ「一時間十分」', dur: 28 },
+      { id: 'j2p2', name: '送電線「稜線になるの？」', dur: 28 },
+      { id: 'j2p3', name: 'トンネル「見なかったことにした」', dur: 30 },
+    ],
+  },
+  {
+    title: '覚醒', boss: '召野カイト', glyph: '召', color: '#4a7bff', colorIdx: C_BLUE,
+    quote: '「大丈夫。完了した」',
+    phases: [
+      { id: 'j3p1', name: '指輪「左手薬指」', dur: 28 },
+      { id: 'j3p2', name: '英語「I was watching」', dur: 28 },
+      { id: 'j3p3', name: '玉砕「片思いの✝本質✝」', dur: 32 },
+    ],
+  },
+  {
+    title: '二つの「は？」', boss: '三峰瑠衣', glyph: '峰', color: '#b86bff', colorIdx: C_VIOLET,
+    quote: '「あんたもずっと〈は？〉って思ってるでしょ」',
+    phases: [
+      { id: 'j4p1', name: '来訪「何この教室」', dur: 28 },
+      { id: 'j4p2', name: 'お目付け役「紺のネクタイ」', dur: 28 },
+      { id: 'j4p3', name: '二つの「は？」', dur: 32 },
+    ],
+  },
+  {
+    title: '特別試験', boss: '校長', glyph: '校', color: '#ffd23f', colorIdx: C_YELLOW,
+    quote: '「下位チームのクラスは……予算削減だ」',
+    phases: [
+      { id: 'j5p1', name: '異棟合同課題', dur: 28 },
+      { id: 'j5p2', name: '予算削減「ハワイが消える」', dur: 30 },
+      { id: 'j5p3', name: '五人一組', dur: 30 },
+    ],
+  },
+  {
+    title: '冷笑', boss: '三重県臣', glyph: '冷', color: '#dfe8ff', colorIdx: C_WHITE,
+    quote: '「刺さってない」',
+    phases: [
+      { id: 'j6p1', name: '冷笑「まあ」', dur: 28 },
+      { id: 'j6p2', name: '防御「ふーん」', dur: 28 },
+      { id: 'j6p3', name: '「言わなかっただけだ」', dur: 30 },
+      { id: 'j6p4', name: '「は？じゃない」', dur: 40 },
+    ],
+  },
+];
+
+export function stagesOf(mode: number): readonly StageDef[] {
+  return mode === 1 ? JUMP_STAGES : STAGES;
+}
+
+/** 通しプレイ（STAGE 1 → FINAL）で L が動く範囲 */
+export function stageLevelRange(mode: number, d: number): [number, number] {
+  const st = stagesOf(mode);
+  const lastStage = st.length - 1;
+  const lastPhase = st[lastStage].phases.length - 1;
+  return [levelOf(d, 0, 0, 0), levelOf(d, lastStage, lastPhase, 1)];
 }
 
 /** ポップアップ文字列（事前確保：毎フレームの文字列生成ゼロ） */
@@ -208,20 +310,25 @@ export const ENDING_LINES: readonly string[] = [
 ];
 
 // ── Save data ──────────────────────────────────────────────
+/** スロット = mode * 4 + difficulty（モード × 難易度で独立） */
+export const SLOT = (mode: number, d: number): number => mode * DIFFS.length + d;
+export const N_SLOTS = MODES.length * DIFFS.length;
+
 export interface Progress {
-  /** 各難易度で到達済みのステージ index（N_STAGES で全クリア） */
-  reached: number[];
+  /** 各スロットのハイスコア */
   hi: number[];
+  /** 各スロットの通しクリア回数（0 = その難易度は未クリア） */
   clears: number[];
 }
 
-export const SAVE_KEY = 'honshitsu-danmaku-v1';
+export const SAVE_KEY = 'honshitsu-danmaku-v2';
 
 export function defaultProgress(): Progress {
-  return { reached: [0, -1, -1, -1], hi: [0, 0, 0, 0], clears: [0, 0, 0, 0] };
+  return { hi: new Array<number>(N_SLOTS).fill(0), clears: new Array<number>(N_SLOTS).fill(0) };
 }
 
-export function isDiffUnlocked(p: Progress, d: number): boolean {
+/** 通しクリア（STAGE 1 → FINAL）で次の偏差値が解禁される */
+export function isDiffUnlocked(p: Progress, mode: number, d: number): boolean {
   if (d === 0) return true;
-  return p.reached[d - 1] >= N_STAGES;
+  return p.clears[SLOT(mode, d - 1)] > 0;
 }

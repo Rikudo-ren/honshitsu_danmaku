@@ -9,13 +9,16 @@ import {
   W, H, TAU, TYPE_HIT, TYPE_VIS, TYPE_ROT, COLORS, N_COLORS,
   T_SMALL, T_MED, T_LARGE, T_CROSS, T_PETAL,
   C_RED, C_YELLOW, C_VIOLET, C_PINK, C_WHITE,
-  B_LINEAR, B_REDIRECT, B_BOUNCE, B_POLAR, B_GRAVITY, B_SINE, B_STEP, B_SPLIT, B_HOMING,
+  B_LINEAR, B_REDIRECT, B_BOUNCE, B_POLAR, B_GRAVITY, B_SINE, B_STEP, B_SPLIT, B_HOMING, B_FLOOR,
   FL_GRAZED, FL_STOP, FL_FADE, FL_SUPER, FL_NOCULL,
   F_DISPLAY, F_UI, F_MINCHO,
-  DIFFS, STAGES, N_STAGES, STAGE_LABELS, POP_TEXTS, POP_MAA, POP_EXTEND, COUNTDOWN, ENDING_LINES,
+  DIFFS, STAGES, JUMP_STAGES, STAGE_LABELS, POP_TEXTS, POP_MAA, POP_EXTEND, COUNTDOWN, ENDING_LINES,
+  FLOOR_Y, JUMP_G, JUMP_MIN, JUMP_MAX, JUMP_CHARGE, JUMP_AIR, JUMP_AIR_CD, RUN_FAST, RUN_SLOW,
+  stagesOf, type StageDef,
   levelOf, spdMul, denMul, rateMul,
 } from './data';
 import { PATTERNS, attractPattern, type PatternDef } from './patterns';
+import { PATTERNS_JUMP } from './patternsJump';
 import { GameAudio } from './audio';
 import { buildSprites, buildDigits, type SpriteSet, type DigitAtlas, DIGIT_DOT, DIGIT_PLUS } from './sprites';
 
@@ -47,8 +50,9 @@ export type Mode = 'attract' | 'intro' | 'phase' | 'gap' | 'stageclear' | 'over'
 
 export interface RunResult {
   cleared: boolean;
+  /** 0 = 回避弾幕 / 1 = 無限ジャンプ */
+  ruleMode: number;
   difficulty: number;
-  startStage: number;
   stageReached: number;
   score: number;
   graze: number;
@@ -59,7 +63,6 @@ export interface RunResult {
 }
 
 export interface EngineEvents {
-  onStageReached: (d: number, s: number) => void;
   onEnd: (r: RunResult) => void;
   onPause: (paused: boolean) => void;
 }
@@ -82,7 +85,7 @@ const FONT_COUNT = `96px ${F_DISPLAY}`;
 const FONT_END = `800 19px ${F_MINCHO}`;
 const FONT_BOMBCHIP = `700 9px ${F_UI}`;
 const DIFF_HUD: readonly string[] = DIFFS.map((d) => `${d.name} · 偏差値`);
-const BOSS_HUD: readonly string[] = STAGES.map((s) => `${s.boss}`);
+const BG_TITLE = STAGES.length + JUMP_STAGES.length;
 
 function ease(t: number): number {
   return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
@@ -173,7 +176,7 @@ function genContour(seed: number, color: string): HTMLCanvasElement {
   return c;
 }
 
-function genBase(idx: number, color: string): HTMLCanvasElement {
+function genBase(color: string, stars: boolean, floor = false): HTMLCanvasElement {
   const c = mkCanvas(W, H);
   const g = c.getContext('2d')!;
   const lg = g.createLinearGradient(0, 0, 0, H);
@@ -190,8 +193,8 @@ function genBase(idx: number, color: string): HTMLCanvasElement {
   g.fillRect(0, 0, W, H);
   g.globalAlpha = 1;
   // 星（寺地ステージ / タイトル / 最終）
-  if (idx === 2 || idx === 6 || idx === 5) {
-    let s = 987654 + idx;
+  if (stars) {
+    let s = 987654 + Math.round(color.charCodeAt(1) * 31 + color.length * 7);
     for (let i = 0; i < 160; i++) {
       s = (s * 1103515245 + 12345) >>> 0;
       const x = (s % 4800) / 10;
@@ -202,6 +205,22 @@ function genBase(idx: number, color: string): HTMLCanvasElement {
       g.fillStyle = '#ffffff';
       g.fillRect(x, y, (s & 3) === 0 ? 1.6 : 0.9, (s & 3) === 0 ? 1.6 : 0.9);
     }
+  }
+  if (floor) {
+    // 無限ジャンプモードの地面（線は FLOOR_Y + 12）
+    const fy = FLOOR_Y + 12;
+    const lg2 = g.createLinearGradient(0, fy, 0, H);
+    lg2.addColorStop(0, color);
+    lg2.addColorStop(1, 'rgba(0,0,0,0)');
+    g.globalAlpha = 0.16;
+    g.fillStyle = lg2;
+    g.fillRect(0, fy, W, H - fy);
+    g.globalAlpha = 0.5;
+    g.fillStyle = color;
+    g.fillRect(0, fy, W, 1.4);
+    g.globalAlpha = 0.1;
+    for (let x = 0; x <= W; x += 24) g.fillRect(x, fy, 1, H - fy);
+    g.globalAlpha = 1;
   }
   return c;
 }
@@ -315,6 +334,14 @@ export class Engine {
   private deathTimer = -1;
   private focus = false;
   private moving = false;
+  // 無限ジャンプモード用の物理状態
+  private vy = 0;
+  private grounded = true;
+  private charge = 0;
+  private jumpHeld = false;
+  private jumpPress = false;
+  private jumpRel = false;
+  private airCd = 0;
 
   // ── Input ──────────────────────────────────────────────
   private kL = false;
@@ -338,12 +365,14 @@ export class Engine {
   mode: Mode = 'attract';
   private modeT = 0;
   private globalT = 0;
+  /** 0 = 回避弾幕 ／ 1 = 無限ジャンプ */
+  ruleMode = 0;
+  private stages: readonly StageDef[] = STAGES;
   diff = 0;
   stage = 0;
   phase = 0;
   phaseT = 0;
   private phaseDur = 1;
-  private startStage = 0;
   private pattern: PatternDef | null = null;
   L = 0;
   sp = 1;
@@ -425,11 +454,15 @@ export class Engine {
     this.sprites = buildSprites();
     this.digits = buildDigits('#ffffff', F_UI);
     this.gold = buildDigits('#ffd98a', F_UI);
-    for (let i = 0; i < N_STAGES; i++) {
-      this.bgBase.push(genBase(i, STAGES[i].color));
+    for (let i = 0; i < STAGES.length; i++) {
+      this.bgBase.push(genBase(STAGES[i].color, i === 2 || i === 5));
       this.bgContour.push(genContour(1000 + i * 7777, STAGES[i].color));
     }
-    this.bgBase.push(genBase(6, '#8fa0ff'));
+    for (let i = 0; i < JUMP_STAGES.length; i++) {
+      this.bgBase.push(genBase(JUMP_STAGES[i].color, i === JUMP_STAGES.length - 1, true));
+      this.bgContour.push(genContour(31000 + i * 6151, JUMP_STAGES[i].color));
+    }
+    this.bgBase.push(genBase('#8fa0ff', true));
     this.bgContour.push(genContour(424242, '#9fb0ff'));
     this.vignette = genVignette(0, 0, 0, 0.62);
     this.dangerVig = genVignette(255, 20, 60, 0.7);
@@ -483,7 +516,7 @@ export class Engine {
     this.modeT = 0;
     this.bossVisible = false;
     this.playerAlive = false;
-    this.bgIdx = 6;
+    this.bgIdx = BG_TITLE;
     this.paused = false;
     this.L = 1;
     this.sp = 1;
@@ -493,10 +526,12 @@ export class Engine {
     this.audio.bgmStart(6, 0);
   }
 
-  startRun(d: number, s: number, hi: number): void {
+  /** 通しプレイ：常に STAGE 1 から FINAL まで一気 */
+  startRun(mode: number, d: number, hi: number): void {
     this.audio.init();
+    this.ruleMode = mode === 1 ? 1 : 0;
+    this.stages = stagesOf(this.ruleMode);
     this.diff = d;
-    this.startStage = s;
     this.score = 0;
     this.hi = hi;
     this.graze = 0;
@@ -510,13 +545,14 @@ export class Engine {
     this.ended = false;
     this.clearAll();
     this.plX = this.plPX = W / 2;
-    this.plY = this.plPY = H - 70;
+    this.plY = this.plPY = this.spawnY();
+    this.resetJump();
     for (let i = 0; i < 10; i++) { this.trailX[i] = this.plX; this.trailY[i] = this.plY; }
     this.playerAlive = true;
     this.invuln = 0;
     this.deathTimer = -1;
     this.paused = false;
-    this.beginStage(s);
+    this.beginStage(0);
   }
 
   setPaused(p: boolean): void {
@@ -538,6 +574,25 @@ export class Engine {
 
   isPlaying(): boolean {
     return this.mode !== 'attract';
+  }
+
+  /** 無限ジャンプモードか（パターン側からも参照） */
+  isJump(): boolean {
+    return this.ruleMode === 1;
+  }
+
+  private spawnY(): number {
+    return this.ruleMode === 1 ? FLOOR_Y : H - 70;
+  }
+
+  private resetJump(): void {
+    this.vy = 0;
+    this.grounded = true;
+    this.charge = 0;
+    this.jumpHeld = false;
+    this.jumpPress = false;
+    this.jumpRel = false;
+    this.airCd = 0;
   }
 
   // ═══ Pattern helper API ═════════════════════════════════
@@ -682,20 +737,19 @@ export class Engine {
     this.stage = s;
     this.mode = 'intro';
     this.modeT = 0;
-    this.bgIdx = s;
+    this.bgIdx = this.ruleMode * STAGES.length + s;
     this.bossVisible = true;
     this.bossX = this.bossPX = W / 2;
     this.bossY = this.bossPY = -80;
     this.wander = false;
-    this.moveBoss(W / 2, 120, 110);
+    this.moveBoss(W / 2, this.ruleMode === 1 ? 108 : 120, 110);
     this.petals = false;
     this.audio.bgmStart(s, 0);
     this.audio.setIntensity(0);
-    this.events.onStageReached(this.diff, s);
   }
 
   private beginPhase(p: number): void {
-    const st = STAGES[this.stage];
+    const st = this.stages[this.stage];
     this.phase = p;
     this.mode = 'phase';
     this.modeT = 0;
@@ -704,7 +758,7 @@ export class Engine {
     this.tmr.fill(0.999);
     this.cnt.fill(0);
     this.fv.fill(0);
-    this.seed = ((this.diff * 7919 + this.stage * 104729 + p * 1299709 + 12345) >>> 0) | 1;
+    this.seed = ((this.ruleMode * 15485863 + this.diff * 7919 + this.stage * 104729 + p * 1299709 + 12345) >>> 0) | 1;
     this.wander = true;
     this.wellOn = false;
     this.emitN = 0;
@@ -715,14 +769,14 @@ export class Engine {
     this.phaseMissed = false;
     this.phaseBombed = false;
     this.updateLevel();
-    this.pattern = PATTERNS[st.phases[p].id] ?? null;
+    this.pattern = (this.ruleMode === 1 ? PATTERNS_JUMP : PATTERNS)[st.phases[p].id] ?? null;
     if (this.pattern && this.pattern.init) this.pattern.init(this, this.L);
     this.cutinT = 0;
     this.ctx.font = FONT_PHASE;
     this.phaseNameW = this.ctx.measureText(st.phases[p].name).width;
     this.audio.cutin();
     const last = p === st.phases.length - 1;
-    this.audio.setIntensity(this.stage === N_STAGES - 1 && last ? 3 : p === 0 ? 1 : 2);
+    this.audio.setIntensity(this.stage === this.stages.length - 1 && last ? 3 : p === 0 ? 1 : 2);
   }
 
   private updateLevel(): void {
@@ -753,11 +807,11 @@ export class Engine {
     this.flash = 0.35;
     this.flashRed = false;
     this.shake = 6;
-    for (let k = 0; k < 3; k++) this.addP(K_RING, this.bossX, this.bossY, 6 + k * 3, 0, 40, 10, STAGES[this.stage].colorIdx);
+    for (let k = 0; k < 3; k++) this.addP(K_RING, this.bossX, this.bossY, 6 + k * 3, 0, 40, 10, this.stages[this.stage].colorIdx);
   }
 
   private nextAfterGap(): void {
-    const st = STAGES[this.stage];
+    const st = this.stages[this.stage];
     if (this.phase + 1 < st.phases.length) {
       this.beginPhase(this.phase + 1);
       return;
@@ -766,9 +820,9 @@ export class Engine {
     this.modeT = 0;
     this.stageBonus = (this.lives * 50000 + this.bombs * 20000) * (this.diff + 1) * (this.stage + 1);
     this.score += this.stageBonus;
-    this.burst(this.bossX, this.bossY, 140, STAGES[this.stage].colorIdx, 9, 2.2);
+    this.burst(this.bossX, this.bossY, 140, this.stages[this.stage].colorIdx, 9, 2.2);
     this.burst(this.bossX, this.bossY, 60, C_WHITE, 12, 1.4);
-    for (let k = 0; k < 5; k++) this.addP(K_RING, this.bossX, this.bossY, 4 + k * 2.5, 0, 50 + k * 6, 6, k & 1 ? C_WHITE : STAGES[this.stage].colorIdx);
+    for (let k = 0; k < 5; k++) this.addP(K_RING, this.bossX, this.bossY, 4 + k * 2.5, 0, 50 + k * 6, 6, k & 1 ? C_WHITE : this.stages[this.stage].colorIdx);
     this.shake = 18;
     this.flash = 0.85;
     this.flashRed = false;
@@ -776,7 +830,6 @@ export class Engine {
     this.audio.stageClear();
     this.audio.setIntensity(0);
     this.moveBoss(W / 2, -160, 150);
-    this.events.onStageReached(this.diff, this.stage + 1);
   }
 
   private emitEnd(cleared: boolean): void {
@@ -784,9 +837,9 @@ export class Engine {
     this.ended = true;
     this.events.onEnd({
       cleared,
+      ruleMode: this.ruleMode,
       difficulty: this.diff,
-      startStage: this.startStage,
-      stageReached: cleared ? N_STAGES : this.stage,
+      stageReached: cleared ? this.stages.length : this.stage,
       score: this.score,
       graze: this.graze,
       misses: this.misses,
@@ -842,7 +895,8 @@ export class Engine {
     this.invuln = 180;
     this.gauge = Math.floor(this.gauge * 0.5);
     this.plX = this.plPX = W / 2;
-    this.plY = this.plPY = H - 60;
+    this.plY = this.plPY = this.ruleMode === 1 ? FLOOR_Y : H - 60;
+    this.resetJump();
     this.addP(K_RING, this.plX, this.plY, -1.2, 0, 40, 60, C_PINK);
   }
 
@@ -950,7 +1004,7 @@ export class Engine {
         break;
       case 'stageclear':
         if (this.modeT >= CLEAR_T) {
-          if (this.stage + 1 < N_STAGES) this.beginStage(this.stage + 1);
+          if (this.stage + 1 < this.stages.length) this.beginStage(this.stage + 1);
           else {
             this.mode = 'ending';
             this.modeT = 0;
@@ -1010,6 +1064,16 @@ export class Engine {
       if (this.mode !== 'ending') this.doBomb();
     }
     this.focus = this.kF;
+    if (this.ruleMode === 1) this.updateRunner();
+    else this.updateFlyer();
+    if (this.invuln > 0) this.invuln--;
+    this.trailHead = (this.trailHead + 1) % 10;
+    this.trailX[this.trailHead] = this.plX;
+    this.trailY[this.trailHead] = this.plY;
+  }
+
+  /** 回避弾幕モード：画面内を自由に移動 */
+  private updateFlyer(): void {
     let dx = (this.kR ? 1 : 0) - (this.kL ? 1 : 0);
     let dy = (this.kD ? 1 : 0) - (this.kU ? 1 : 0);
     if (dx !== 0 && dy !== 0) { dx *= 0.7071; dy *= 0.7071; }
@@ -1031,10 +1095,63 @@ export class Engine {
     if (y < 14) y = 14; else if (y > H - 12) y = H - 12;
     this.plX = x;
     this.plY = y;
-    if (this.invuln > 0) this.invuln--;
-    this.trailHead = (this.trailHead + 1) % 10;
-    this.trailX[this.trailHead] = x;
-    this.trailY[this.trailHead] = y;
+  }
+
+  /**
+   * 無限ジャンプモード：重力 + 左右移動 + ジャンプ。
+   * ジャンプ力は長押し時間で変わる（上限あり・高くしない）。
+   * 空中ジャンプは回数無制限だが、再使用間隔 JUMP_AIR_CD のぶん重力で落ちるため
+   * 高度を稼ぎ続けることはできない。
+   */
+  private updateRunner(): void {
+    const dir = (this.kR ? 1 : 0) - (this.kL ? 1 : 0);
+    let mx = dir * (this.focus ? RUN_SLOW : RUN_FAST);
+    let ddx = this.dragDX;
+    this.dragDX = 0;
+    this.dragDY = 0;
+    if (ddx > 24) ddx = 24; else if (ddx < -24) ddx = -24;
+    mx += ddx;
+
+    if (this.jumpPress) {
+      this.jumpPress = false;
+      this.jumpHeld = true;
+      this.charge = 0;
+    }
+    if (this.jumpHeld && this.charge < JUMP_CHARGE) this.charge++;
+    if (this.jumpRel) {
+      this.jumpRel = false;
+      this.jumpHeld = false;
+      if (this.grounded) {
+        const p = this.charge / JUMP_CHARGE;
+        this.vy = -(JUMP_MIN + (JUMP_MAX - JUMP_MIN) * p);
+        this.grounded = false;
+        this.airCd = JUMP_AIR_CD;
+        this.addP(K_RING, this.plX, FLOOR_Y, 2.4, 0, 16, 2, C_WHITE);
+      } else if (this.airCd === 0 && this.vy > -JUMP_AIR) {
+        this.vy = -JUMP_AIR;
+        this.airCd = JUMP_AIR_CD;
+        this.addP(K_RING, this.plX, this.plY, 2, 0, 14, 2, C_PINK);
+      }
+      this.charge = 0;
+    }
+    if (this.airCd > 0) this.airCd--;
+    this.vy += JUMP_G;
+    if (this.vy > 11) this.vy = 11;
+    let y = this.plY + this.vy;
+    if (y >= FLOOR_Y) {
+      if (!this.grounded) {
+        this.grounded = true;
+        this.airCd = 0;
+        this.addP(K_RING, this.plX, FLOOR_Y, 1.6, 0, 12, 1.6, C_WHITE);
+      }
+      y = FLOOR_Y;
+      this.vy = 0;
+    }
+    let x = this.plX + mx;
+    if (x < 8) x = 8; else if (x > W - 8) x = W - 8;
+    this.moving = mx !== 0 || !this.grounded;
+    this.plX = x;
+    this.plY = y;
   }
 
   private updateBoss(): void {
@@ -1176,6 +1293,33 @@ export class Engine {
             x += Math.cos(a) * s;
             y += Math.sin(a) * s;
             break;
+          case B_FLOOR: {
+            // 放物運動：床で減衰しながら跳ね、跳ね切ったら床を転がる
+            const vx = this.b2[i];
+            let vy = this.b3[i] + 0.16;
+            if (vy > 7) vy = 7;
+            x += vx;
+            y += vy;
+            if (y >= FLOOR_Y && vy > 0) {
+              const n = this.b0[i] - 1;
+              this.b0[i] = n;
+              y = FLOOR_Y;
+              if (n > 0) {
+                this.b3[i] = -vy * 0.72;
+                this.b2[i] = vx * 0.94;
+              } else {
+                this.bbeh[i] = B_LINEAR;
+                this.ba[i] = vx >= 0 ? 0 : Math.PI;
+                this.bs[i] = Math.abs(vx);
+                this.bacc[i] = 0;
+                this.bav[i] = 0;
+              }
+            } else {
+              this.b3[i] = vy;
+            }
+            a = Math.atan2(this.b3[i], this.b2[i]);
+            break;
+          }
         }
         this.ba[i] = a;
         if (flg & FL_SUPER && t >= 80) {
@@ -1304,7 +1448,7 @@ export class Engine {
     const r2 = this.cancelR * this.cancelR;
     const cx = this.cancelX;
     const cy = this.cancelY;
-    const petal = this.stage === N_STAGES - 1 && this.mode !== 'attract';
+    const petal = this.stage === this.stages.length - 1 && this.mode !== 'attract';
     let i = 0;
     while (i < this.bn) {
       const dx = this.bx[i] - cx;
@@ -1414,13 +1558,20 @@ export class Engine {
   // ═══ Input ═══════════════════════════════════════════════
   private onKeyDown = (e: KeyboardEvent): void => {
     let handled = true;
+    const jump = this.ruleMode === 1;
     switch (e.code) {
       case 'ArrowLeft': case 'KeyA': this.kL = true; break;
       case 'ArrowRight': case 'KeyD': this.kR = true; break;
-      case 'ArrowUp': case 'KeyW': this.kU = true; break;
+      case 'ArrowUp': case 'KeyW':
+        if (jump) { if (!e.repeat) this.jumpPress = true; } else this.kU = true;
+        break;
       case 'ArrowDown': case 'KeyS': this.kD = true; break;
       case 'ShiftLeft': case 'ShiftRight': this.kF = true; break;
-      case 'KeyX': case 'Space': case 'KeyC':
+      case 'Space':
+        if (jump) { if (!e.repeat) this.jumpPress = true; }
+        else if (!e.repeat && !this.paused) this.bombReq = true;
+        break;
+      case 'KeyX': case 'KeyC':
         if (!e.repeat && !this.paused) this.bombReq = true;
         break;
       case 'Escape': case 'KeyP':
@@ -1437,17 +1588,26 @@ export class Engine {
   };
 
   private onKeyUp = (e: KeyboardEvent): void => {
+    const jump = this.ruleMode === 1;
     switch (e.code) {
       case 'ArrowLeft': case 'KeyA': this.kL = false; break;
       case 'ArrowRight': case 'KeyD': this.kR = false; break;
-      case 'ArrowUp': case 'KeyW': this.kU = false; break;
+      case 'ArrowUp': case 'KeyW':
+        if (jump) this.jumpRel = true; else this.kU = false;
+        break;
       case 'ArrowDown': case 'KeyS': this.kD = false; break;
       case 'ShiftLeft': case 'ShiftRight': this.kF = false; break;
+      case 'Space':
+        if (jump) this.jumpRel = true;
+        break;
     }
   };
 
   private onBlur = (): void => {
     this.kL = this.kR = this.kU = this.kD = this.kF = false;
+    this.jumpHeld = false;
+    this.jumpPress = false;
+    this.charge = 0;
   };
 
   private onVis = (): void => {
@@ -1462,6 +1622,7 @@ export class Engine {
     this.audio.init();
     this.activePointers++;
     if (this.activePointers >= 2) this.bombReq = true;
+    if (this.ruleMode === 1 && e.pointerType !== 'mouse') this.jumpPress = true;
     if (this.dragId === -1) {
       this.dragId = e.pointerId;
       this.lastPX = e.clientX;
@@ -1492,6 +1653,7 @@ export class Engine {
   private onPointerUp = (e: PointerEvent): void => {
     this.activePointers = Math.max(0, this.activePointers - 1);
     if (e.pointerId === this.dragId) this.dragId = -1;
+    if (this.ruleMode === 1 && e.pointerType !== 'mouse') this.jumpRel = true;
   };
 
   // ═══ Render ══════════════════════════════════════════════
@@ -1675,7 +1837,7 @@ export class Engine {
 
   private drawBoss(alpha: number): void {
     const c = this.ctx;
-    const st = STAGES[this.stage];
+    const st = this.stages[this.stage];
     const x = this.bossPX + (this.bossX - this.bossPX) * alpha;
     const y = this.bossPY + (this.bossY - this.bossPY) * alpha;
     const col = this.mode === 'attract' ? '#ffffff' : st.color;
@@ -1802,6 +1964,26 @@ export class Engine {
     const y = this.plPY + (this.plY - this.plPY) * alpha;
     const blink = (this.invuln > 0 || this.deathTimer >= 0) && ((this.globalT >> 2) & 1) === 1;
     const baseA = blink ? 0.3 : 1;
+    if (this.ruleMode === 1) {
+      // 無限ジャンプモード：床の影と、長押しチャージのリング
+      const h = Math.max(0, FLOOR_Y - y);
+      const k = Math.max(0, 1 - h / 150);
+      c.globalCompositeOperation = 'source-over';
+      c.globalAlpha = 0.4 * k * baseA;
+      c.fillStyle = '#000000';
+      c.beginPath();
+      c.ellipse(x, FLOOR_Y + 10, Math.max(3, 11 * k), 3.2, 0, 0, TAU);
+      c.fill();
+      if (this.jumpHeld && this.charge > 1) {
+        c.globalCompositeOperation = 'lighter';
+        c.globalAlpha = 0.8 * baseA;
+        c.strokeStyle = '#9fe8ff';
+        c.lineWidth = 2;
+        c.beginPath();
+        c.arc(x, y, 13, -Math.PI / 2, -Math.PI / 2 + TAU * (this.charge / JUMP_CHARGE));
+        c.stroke();
+      }
+    }
     // 残像
     c.globalCompositeOperation = 'lighter';
     if (this.moving) {
@@ -1816,6 +1998,12 @@ export class Engine {
     c.drawImage(this.sprites.glowCrimson, x - 20, y - 20, 40, 40);
     c.globalCompositeOperation = 'source-over';
     c.globalAlpha = baseA;
+    // 無限ジャンプモード：上昇中は伸び、落下中は潰れる
+    const sq = this.ruleMode === 1 ? Math.max(0.8, Math.min(1.25, 1 - this.vy * 0.025)) : 1;
+    c.save();
+    c.translate(x, y);
+    c.scale(2 - sq, sq);
+    c.translate(-x, -y);
     // 三重県臣：えんじのネクタイ
     c.fillStyle = '#7d0f2a';
     c.strokeStyle = '#ffd3dc';
@@ -1839,6 +2027,7 @@ export class Engine {
     c.lineTo(x - 1.4, y - 4.5);
     c.closePath();
     c.fill();
+    c.restore();
     c.globalAlpha = 1;
   }
 
@@ -2048,7 +2237,7 @@ export class Engine {
 
   private drawCutin(): void {
     const c = this.ctx;
-    const st = STAGES[this.stage];
+    const st = this.stages[this.stage];
     const t = this.cutinT;
     const inE = t < 16 ? easeOut(t / 16) : 1;
     const outE = t > 86 ? (t - 86) / 24 : 0;
@@ -2091,7 +2280,7 @@ export class Engine {
     c.shadowBlur = 0;
     c.font = FONT_CUT_SUB;
     c.fillStyle = 'rgba(255,255,255,0.7)';
-    c.fillText(BOSS_HUD[this.stage], W / 2 + slide * 0.6, yc + 32);
+    c.fillText(this.stages[this.stage].boss, W / 2 + slide * 0.6, yc + 32);
     c.globalAlpha = 1;
   }
 
@@ -2119,7 +2308,7 @@ export class Engine {
 
   private drawHUD(): void {
     const c = this.ctx;
-    const st = STAGES[this.stage];
+    const st = this.stages[this.stage];
     const d = DIFFS[this.diff];
     c.globalAlpha = 1;
     c.textBaseline = 'alphabetic';
@@ -2214,7 +2403,7 @@ export class Engine {
 
   private drawIntro(): void {
     const c = this.ctx;
-    const st = STAGES[this.stage];
+    const st = this.stages[this.stage];
     const t = this.modeT;
     const a = Math.min(1, t / 20) * Math.min(1, (INTRO - t) / 25);
     if (a <= 0) return;
@@ -2238,7 +2427,7 @@ export class Engine {
     c.shadowBlur = 0;
     c.font = FONT_HUD_M;
     c.fillStyle = 'rgba(255,255,255,0.7)';
-    c.fillText(BOSS_HUD[this.stage], W / 2, 302);
+    c.fillText(this.stages[this.stage].boss, W / 2, 302);
     const wipe = Math.max(0, Math.min(1, (t - 45) / 70));
     c.save();
     c.beginPath();
@@ -2260,7 +2449,7 @@ export class Engine {
     c.textBaseline = 'middle';
     c.font = FONT_BANNER;
     c.fillStyle = '#ffffff';
-    c.shadowColor = STAGES[this.stage].color;
+    c.shadowColor = this.stages[this.stage].color;
     c.shadowBlur = 18;
     c.fillText('✝本質回避✝', W / 2, 250);
     c.shadowBlur = 0;
@@ -2290,7 +2479,7 @@ export class Engine {
     c.textBaseline = 'middle';
     c.font = FONT_BANNER;
     c.fillStyle = '#ffffff';
-    c.shadowColor = STAGES[this.stage].color;
+    c.shadowColor = this.stages[this.stage].color;
     c.shadowBlur = 20;
     c.fillText('STAGE CLEAR', W / 2, 250);
     c.shadowBlur = 0;
