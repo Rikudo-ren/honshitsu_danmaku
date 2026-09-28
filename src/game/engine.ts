@@ -342,6 +342,8 @@ export class Engine {
   private jumpPress = false;
   private jumpRel = false;
   private airCd = 0;
+  private jumpBuf = 0;
+  private bufCharge = 0;
 
   // ── Input ──────────────────────────────────────────────
   private kL = false;
@@ -593,6 +595,8 @@ export class Engine {
     this.jumpPress = false;
     this.jumpRel = false;
     this.airCd = 0;
+    this.jumpBuf = 0;
+    this.bufCharge = 0;
   }
 
   // ═══ Pattern helper API ═════════════════════════════════
@@ -1121,19 +1125,19 @@ export class Engine {
     if (this.jumpRel) {
       this.jumpRel = false;
       this.jumpHeld = false;
-      if (this.grounded) {
-        const p = this.charge / JUMP_CHARGE;
-        this.vy = -(JUMP_MIN + (JUMP_MAX - JUMP_MIN) * p);
-        this.grounded = false;
-        this.airCd = JUMP_AIR_CD;
-        this.addP(K_RING, this.plX, FLOOR_Y, 2.4, 0, 16, 2, C_WHITE);
-      } else if (this.airCd === 0 && this.vy > -JUMP_AIR) {
+      if (this.grounded) this.doJump(this.charge);
+      else if (this.airCd === 0 && this.vy > -JUMP_AIR) {
         this.vy = -JUMP_AIR;
         this.airCd = JUMP_AIR_CD;
         this.addP(K_RING, this.plX, this.plY, 2, 0, 14, 2, C_PINK);
+      } else {
+        // 着地直前の入力を吸収（ジャンプバッファ）
+        this.jumpBuf = 12;
+        this.bufCharge = this.charge;
       }
       this.charge = 0;
     }
+    if (this.jumpBuf > 0) this.jumpBuf--;
     if (this.airCd > 0) this.airCd--;
     this.vy += JUMP_G;
     if (this.vy > 11) this.vy = 11;
@@ -1146,12 +1150,23 @@ export class Engine {
       }
       y = FLOOR_Y;
       this.vy = 0;
+      if (this.jumpBuf > 0) this.doJump(this.bufCharge);   // 着地瞬间に跳ぶ
     }
     let x = this.plX + mx;
     if (x < 8) x = 8; else if (x > W - 8) x = W - 8;
     this.moving = mx !== 0 || !this.grounded;
     this.plX = x;
     this.plY = y;
+  }
+
+  private doJump(charge: number): void {
+    const p = Math.min(1, Math.max(0, charge / JUMP_CHARGE));
+    this.vy = -(JUMP_MIN + (JUMP_MAX - JUMP_MIN) * p);
+    this.grounded = false;
+    this.airCd = JUMP_AIR_CD;
+    this.jumpBuf = 0;
+    this.bufCharge = 0;
+    this.addP(K_RING, this.plX, FLOOR_Y, 2.4, 0, 16, 2, C_WHITE);
   }
 
   private updateBoss(): void {
