@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
-import { Maximize2, Volume2, VolumeX, Pause, Play, Lock, ChevronRight, RotateCcw, Home, Trophy, Check, Keyboard, Hand } from 'lucide-react';
+import { Maximize2, Volume2, VolumeX, Pause, Play, Lock, ChevronRight, RotateCcw, Home, Trophy, Check } from 'lucide-react';
 import { Engine, type RunResult } from './game/engine';
 import {
-  DIFFS, STAGES, N_STAGES, W, H, SAVE_KEY, ENDING_LINES,
-  defaultProgress, isDiffUnlocked, stageLevelRange, type Progress,
+  DIFFS, STAGES, N_STAGES, W, H, SAVE_KEY, ENDING_LINES, KINDS,
+  defaultProgress, isDiffUnlocked, type Progress, type KindId,
 } from './game/data';
 
 type Screen = 'title' | 'select' | 'playing' | 'paused' | 'result';
@@ -15,6 +15,9 @@ const UI: CSSProperties = { fontFamily: '"Zen Kaku Gothic New", "Hiragino Sans",
 
 function isNumArr(v: unknown, len: number): v is number[] {
   return Array.isArray(v) && v.length === len && v.every((x) => typeof x === 'number' && Number.isFinite(x));
+}
+function num(v: unknown, d = 0): number {
+  return typeof v === 'number' && Number.isFinite(v) ? v : d;
 }
 
 function loadProgress(): Progress {
@@ -27,6 +30,8 @@ function loadProgress(): Progress {
       reached: isNumArr(p.reached, 4) ? p.reached : d.reached,
       hi: isNumArr(p.hi, 4) ? p.hi : d.hi,
       clears: isNumArr(p.clears, 4) ? p.clears : d.clears,
+      jumpHi: num(p.jumpHi),
+      jumpBest: num(p.jumpBest),
     };
   } catch {
     return defaultProgress();
@@ -41,15 +46,15 @@ function saveProgress(p: Progress): void {
   }
 }
 
-function stagePlayable(p: Progress, d: number, s: number): boolean {
-  return isDiffUnlocked(p, d) && s <= Math.max(0, Math.min(N_STAGES - 1, p.reached[d]));
-}
-
 function honshitsuHensachi(r: RunResult): number {
   const base = DIFFS[r.difficulty].hensachi - 12;
   const ratio = r.phasesCleared > 0 ? r.noMissPhases / r.phasesCleared : 0;
   const v = base + (r.phasesCleared / 20) * 14 + ratio * 10 - r.misses * 0.8 + Math.min(8, r.graze / 300) + (r.cleared ? 4 : 0);
   return Math.max(25, Math.min(99.9, v));
+}
+
+function fmtTime(frames: number): string {
+  return (frames / 60).toFixed(1);
 }
 
 export default function DanmakuGame() {
@@ -59,8 +64,8 @@ export default function DanmakuGame() {
   const [screen, setScreen] = useState<Screen>('title');
   const [progress, setProgress] = useState<Progress>(loadProgress);
   const progressRef = useRef<Progress>(progress);
+  const [kind, setKind] = useState<KindId>('stage');
   const [selD, setSelD] = useState(0);
-  const [selS, setSelS] = useState(0);
   const [result, setResult] = useState<RunResult | null>(null);
   const [newUnlock, setNewUnlock] = useState(-1);
   const [muted, setMuted] = useState(false);
@@ -79,21 +84,25 @@ export default function DanmakuGame() {
       onStageReached: (d, s) => {
         const cur = progressRef.current;
         if (cur.reached[d] >= s) return;
-        const next: Progress = { reached: [...cur.reached], hi: [...cur.hi], clears: [...cur.clears] };
+        const next: Progress = { ...cur, reached: [...cur.reached], hi: [...cur.hi], clears: [...cur.clears] };
         next.reached[d] = s;
-        if (s >= N_STAGES && d + 1 < DIFFS.length && next.reached[d + 1] < 0) {
-          next.reached[d + 1] = 0;
-          setNewUnlock(d + 1);
-        }
         progressRef.current = next;
         saveProgress(next);
         setProgress(next);
       },
       onEnd: (r) => {
         const cur = progressRef.current;
-        const next: Progress = { reached: [...cur.reached], hi: [...cur.hi], clears: [...cur.clears] };
-        if (r.score > next.hi[r.difficulty]) next.hi[r.difficulty] = r.score;
-        if (r.cleared) next.clears[r.difficulty]++;
+        const next: Progress = { ...cur, reached: [...cur.reached], hi: [...cur.hi], clears: [...cur.clears] };
+        if (r.kind === 'jump') {
+          if (r.score > next.jumpHi) next.jumpHi = r.score;
+          if (r.frames > next.jumpBest) next.jumpBest = r.frames;
+        } else {
+          if (r.score > next.hi[r.difficulty]) next.hi[r.difficulty] = r.score;
+          if (r.cleared) {
+            next.clears[r.difficulty]++;
+            if (next.clears[r.difficulty] === 1 && r.difficulty + 1 < DIFFS.length) setNewUnlock(r.difficulty + 1);
+          }
+        }
         progressRef.current = next;
         saveProgress(next);
         setProgress(next);
@@ -137,14 +146,25 @@ export default function DanmakuGame() {
     setScreen('select');
   }, [ensureAudio]);
 
-  const startGame = useCallback((d: number, s: number) => {
+  const startGame = useCallback((d: number) => {
     const eng = engineRef.current;
-    if (!eng || !stagePlayable(progressRef.current, d, s)) return;
+    if (!eng || !isDiffUnlocked(progressRef.current, d)) return;
     ensureAudio();
     eng.audio.select();
     setNewUnlock(-1);
     setResult(null);
-    eng.startRun(d, s, progressRef.current.hi[d]);
+    eng.startRun(d, progressRef.current.hi[d]);
+    setScreen('playing');
+  }, [ensureAudio]);
+
+  const startJumpRun = useCallback(() => {
+    const eng = engineRef.current;
+    if (!eng) return;
+    ensureAudio();
+    eng.audio.select();
+    setNewUnlock(-1);
+    setResult(null);
+    eng.startJump(progressRef.current.jumpHi);
     setScreen('playing');
   }, [ensureAudio]);
 
@@ -175,9 +195,9 @@ export default function DanmakuGame() {
 
   const retry = useCallback(() => {
     if (!result) return;
-    const s = result.cleared ? 0 : Math.min(result.stageReached, N_STAGES - 1);
-    startGame(result.difficulty, s);
-  }, [result, startGame]);
+    if (result.kind === 'jump') startJumpRun();
+    else startGame(result.difficulty);
+  }, [result, startGame, startJumpRun]);
 
   const toggleMute = useCallback(() => {
     setMuted((m) => {
@@ -200,6 +220,11 @@ export default function DanmakuGame() {
     setScreen('paused');
   }, [screen]);
 
+  const toggleKind = useCallback((k: KindId) => {
+    engineRef.current?.audio.ui();
+    setKind(k);
+  }, []);
+
   // ── メニュー用キーボード操作 ─────────────────────────────
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
@@ -213,24 +238,21 @@ export default function DanmakuGame() {
         const eng = engineRef.current;
         if (code === 'ArrowLeft' || code === 'ArrowRight') {
           e.preventDefault();
+          if (kind !== 'stage') return;
           const dir = code === 'ArrowLeft' ? -1 : 1;
           let nd = selD + dir;
           while (nd >= 0 && nd < DIFFS.length && !isDiffUnlocked(progress, nd)) nd += dir;
           if (nd >= 0 && nd < DIFFS.length) {
             setSelD(nd);
-            setSelS(Math.min(selS, Math.max(0, Math.min(N_STAGES - 1, progress.reached[nd]))));
             eng?.audio.ui();
           }
         } else if (code === 'ArrowUp' || code === 'ArrowDown') {
           e.preventDefault();
-          const ns = selS + (code === 'ArrowUp' ? -1 : 1);
-          if (ns >= 0 && ns < N_STAGES && stagePlayable(progress, selD, ns)) {
-            setSelS(ns);
-            eng?.audio.ui();
-          }
+          toggleKind(kind === 'stage' ? 'jump' : 'stage');
         } else if (code === 'Enter' || code === 'KeyZ') {
           e.preventDefault();
-          startGame(selD, selS);
+          if (kind === 'stage') startGame(selD);
+          else startJumpRun();
         } else if (code === 'Escape' || code === 'KeyX') {
           setScreen('title');
         }
@@ -245,7 +267,7 @@ export default function DanmakuGame() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [screen, selD, selS, progress, goSelect, startGame, retry, toSelect]);
+  }, [screen, selD, progress, kind, goSelect, startGame, startJumpRun, retry, toSelect, toggleKind]);
 
   const overlayStyle: CSSProperties = { width: size.w, height: size.h };
   const diff = DIFFS[selD];
@@ -277,7 +299,7 @@ export default function DanmakuGame() {
           {/* ── TITLE ───────────────────────────────────── */}
           {screen === 'title' && (
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-gradient-to-b from-black/30 via-black/55 to-black/80 px-5 text-center">
-              <div className="mb-3 text-[10px] tracking-[0.4em] text-rose-200/60">桐葉高校 北棟 理数科 B組より</div>
+              <div className="mb-3 text-[10px] tracking-[0.4em] text-rose-200/60">桐葉高校 理数科 B組より</div>
               <div className="text-lg text-white/90 sm:text-2xl" style={MINCHO}>偏差値60の教室から</div>
               <div
                 className="my-1 bg-gradient-to-b from-white via-rose-100 to-rose-400 bg-clip-text text-6xl leading-tight text-transparent drop-shadow-[0_0_24px_rgba(255,80,120,0.55)] sm:text-8xl"
@@ -286,27 +308,15 @@ export default function DanmakuGame() {
                 ✝本質✝
               </div>
               <div className="text-base text-white/90 sm:text-xl" style={MINCHO}>が漏れ出している件について</div>
-              <div className="mt-4 text-[10px] tracking-[0.35em] text-amber-200/70 sm:text-xs">DANMAKU EVASION — 回避専用弾幕</div>
-              <p className="mt-5 max-w-xs text-xs leading-relaxed text-white/70 sm:text-sm" style={MINCHO}>
-                君は<span className="text-rose-300">三重県臣</span>。否定の守護者。<br />
-                撃つな。避けろ。耐え抜け。<br />
-                どうしようもない時だけ、<span className="text-white">「は？」</span>と言え。
-              </p>
+              <div className="mt-4 text-[10px] tracking-[0.35em] text-amber-200/70 sm:text-xs">DANMAKU ／ ENDLESS JUMP</div>
               <button
                 onClick={goSelect}
-                className="group mt-7 flex items-center gap-2 rounded-sm border border-rose-300/60 bg-rose-900/40 px-8 py-3 text-sm tracking-[0.3em] text-white transition hover:bg-rose-700/60 hover:shadow-[0_0_30px_rgba(255,80,120,0.5)]"
+                className="group mt-10 flex items-center gap-2 rounded-sm border border-rose-300/60 bg-rose-900/40 px-8 py-3 text-sm tracking-[0.3em] text-white transition hover:bg-rose-700/60 hover:shadow-[0_0_30px_rgba(255,80,120,0.5)]"
                 style={DISPLAY}
               >
                 START <ChevronRight className="h-4 w-4 transition group-hover:translate-x-1" />
               </button>
               <div className="mt-2 animate-pulse text-[10px] tracking-widest text-white/40">PRESS ENTER / TAP</div>
-              <div className="mt-6 grid grid-cols-2 gap-x-4 gap-y-1 text-left text-[10px] text-white/55">
-                <span className="flex items-center gap-1"><Keyboard className="h-3 w-3" />矢印 / WASD：移動</span>
-                <span>Shift：低速（精密）</span>
-                <span>X / Space：「は？」</span>
-                <span>Esc / P：ポーズ</span>
-                <span className="col-span-2 flex items-center gap-1"><Hand className="h-3 w-3" />タッチ：どこでもドラッグで相対移動・ダブルタップで「は？」</span>
-              </div>
             </div>
           )}
 
@@ -318,89 +328,98 @@ export default function DanmakuGame() {
                 <div className="text-xs tracking-[0.3em] text-white/80" style={DISPLAY}>SELECT</div>
                 <div className="w-12" />
               </div>
-              <div className="grid grid-cols-4 gap-1 px-3 pt-3">
-                {DIFFS.map((d) => {
-                  const un = isDiffUnlocked(progress, d.id);
-                  const active = selD === d.id;
+
+              {/* モード */}
+              <div className="grid grid-cols-2 gap-1 px-3 pt-3">
+                {KINDS.map((k) => {
+                  const active = kind === k.id;
                   return (
                     <button
-                      key={d.id}
-                      disabled={!un}
-                      onClick={() => {
-                        setSelD(d.id);
-                        setSelS(Math.max(0, Math.min(N_STAGES - 1, progress.reached[d.id])));
-                        engineRef.current?.audio.ui();
-                      }}
+                      key={k.id}
+                      onClick={() => toggleKind(k.id)}
                       className={`relative flex flex-col items-center rounded-sm border px-1 py-2 transition ${
                         active ? 'border-white/80 bg-white/10' : 'border-white/10 bg-white/[0.03] hover:bg-white/10'
-                      } ${un ? '' : 'cursor-not-allowed opacity-35'}`}
+                      }`}
                     >
-                      <span className="text-[9px] tracking-widest" style={{ color: d.color }}>{d.label}</span>
-                      <span className="text-sm" style={MINCHO}>{d.name}</span>
-                      <span className="text-[9px] text-white/50">偏差値{d.hensachi}</span>
-                      {!un && <Lock className="absolute right-1 top-1 h-3 w-3 text-white/60" />}
-                      {progress.clears[d.id] > 0 && <Check className="absolute left-1 top-1 h-3 w-3 text-emerald-300" />}
+                      <span className="text-[9px] tracking-widest" style={{ color: k.color }}>{k.label}</span>
+                      <span className="text-sm" style={MINCHO}>{k.name}</span>
                     </button>
                   );
                 })}
               </div>
-              <div className="px-4 pt-2 text-[10px] leading-relaxed text-white/60" style={MINCHO}>
-                {diff.desc}
-                <span className="ml-2 text-white/40">残機 {diff.lives} ／「は？」 {diff.bombs}</span>
-              </div>
-              <div className="mt-2 flex-1 overflow-y-auto px-3 pb-2">
-                {STAGES.map((st, s) => {
-                  const ok = stagePlayable(progress, selD, s);
-                  const cleared = progress.reached[selD] > s;
-                  const [l0, l1] = stageLevelRange(selD, s);
-                  const active = selS === s && ok;
-                  return (
+
+              {kind === 'stage' ? (
+                <>
+                  <div className="grid grid-cols-4 gap-1 px-3 pt-3">
+                    {DIFFS.map((d) => {
+                      const un = isDiffUnlocked(progress, d.id);
+                      const active = selD === d.id;
+                      return (
+                        <button
+                          key={d.id}
+                          disabled={!un}
+                          onClick={() => {
+                            setSelD(d.id);
+                            engineRef.current?.audio.ui();
+                          }}
+                          className={`relative flex flex-col items-center rounded-sm border px-1 py-2 transition ${
+                            active && un ? 'border-white/80 bg-white/10' : 'border-white/10 bg-white/[0.03] hover:bg-white/10'
+                          } ${un ? '' : 'cursor-not-allowed opacity-35'}`}
+                        >
+                          <span className="text-[9px] tracking-widest" style={{ color: d.color }}>{d.label}</span>
+                          <span className="text-sm" style={MINCHO}>{d.name}</span>
+                          <span className="text-[9px] text-white/50">偏差値{d.hensachi}</span>
+                          {!un && <Lock className="absolute right-1 top-1 h-3 w-3 text-white/60" />}
+                          {progress.clears[d.id] > 0 && <Check className="absolute left-1 top-1 h-3 w-3 text-emerald-300" />}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div className="flex items-center justify-between px-4 pt-3 text-[10px] text-white/60">
+                    <span style={MINCHO}>{diff.name} · 残機 {diff.lives} ／「は？」 {diff.bombs}</span>
+                    <span className="font-mono tracking-wider text-white/50">STAGE 1 → FINAL</span>
+                  </div>
+                  <div className="px-4 pt-1 text-[10px] text-white/45">
+                    到達 {progress.reached[selD] < 0 ? '—' : progress.reached[selD] >= N_STAGES ? 'FINAL' : `STAGE ${progress.reached[selD] + 1}`}
+                    {progress.clears[selD] > 0 && <span className="ml-2 text-emerald-300">通しクリア {progress.clears[selD]}回</span>}
+                  </div>
+                  <div className="flex-1" />
+                  <div className="flex items-center justify-between gap-2 border-t border-white/10 px-4 py-3">
+                    <div className="flex flex-col gap-0.5 text-[10px] text-white/55">
+                      <span className="flex items-center gap-1"><Trophy className="h-3 w-3 text-amber-300" /> HI <span className="font-mono text-amber-200">{progress.hi[selD].toLocaleString()}</span></span>
+                      <span className="text-white/40">←↑↓→ 移動 ／ Shift 低速 ／ X は？</span>
+                    </div>
                     <button
-                      key={s}
-                      disabled={!ok}
-                      onClick={() => {
-                        if (selS === s) startGame(selD, s);
-                        else {
-                          setSelS(s);
-                          engineRef.current?.audio.ui();
-                        }
-                      }}
-                      className={`mb-1 flex w-full items-center gap-3 rounded-sm border px-3 py-2 text-left transition ${
-                        active ? 'border-white/70 bg-white/10' : 'border-white/10 bg-white/[0.02] hover:bg-white/[0.07]'
-                      } ${ok ? '' : 'cursor-not-allowed opacity-30'}`}
+                      onClick={() => startGame(selD)}
+                      className="flex items-center gap-2 rounded-sm border px-6 py-2 text-xs tracking-[0.25em] transition hover:shadow-[0_0_24px_rgba(255,255,255,0.25)]"
+                      style={{ ...DISPLAY, borderColor: diff.color, color: diff.color }}
                     >
-                      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border text-lg" style={{ ...DISPLAY, borderColor: st.color, color: st.color }}>
-                        {ok ? st.glyph : <Lock className="h-4 w-4" />}
-                      </div>
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2 text-[9px] tracking-widest text-white/45">
-                          {s === N_STAGES - 1 ? 'FINAL' : `STAGE ${s + 1}`}
-                          {cleared && <span className="rounded-sm bg-emerald-400/20 px-1 text-emerald-300">CLEAR</span>}
-                        </div>
-                        <div className="truncate text-sm" style={MINCHO}>{ok ? st.title : '？？？'}</div>
-                        <div className="text-[10px] text-white/45">{ok ? `${st.boss}・${st.phases.length}フェーズ` : '前のステージを耐え抜くと解禁'}</div>
-                      </div>
-                      <div className="shrink-0 text-right text-[9px] leading-tight text-white/45">
-                        <div>難度係数</div>
-                        <div className="font-mono text-[11px] text-white/80">{l0.toFixed(2)}–{l1.toFixed(2)}</div>
-                      </div>
+                      開始 <ChevronRight className="h-4 w-4" />
                     </button>
-                  );
-                })}
-              </div>
-              <div className="flex items-center justify-between gap-2 border-t border-white/10 px-4 py-3">
-                <div className="flex items-center gap-1 text-[10px] text-white/55">
-                  <Trophy className="h-3 w-3 text-amber-300" />
-                  HI <span className="font-mono text-amber-200">{progress.hi[selD].toLocaleString()}</span>
-                </div>
-                <button
-                  onClick={() => startGame(selD, selS)}
-                  className="flex items-center gap-2 rounded-sm border px-6 py-2 text-xs tracking-[0.25em] transition hover:shadow-[0_0_24px_rgba(255,255,255,0.25)]"
-                  style={{ ...DISPLAY, borderColor: diff.color, color: diff.color }}
-                >
-                  耐え抜く <ChevronRight className="h-4 w-4" />
-                </button>
-              </div>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="flex-1 px-4 pt-6 text-center">
+                    <div className="text-[10px] tracking-[0.35em] text-white/45">HI SCORE</div>
+                    <div className="font-mono text-3xl text-amber-200">{progress.jumpHi.toLocaleString()}</div>
+                    <div className="mt-5 text-[10px] tracking-[0.35em] text-white/45">最長生存</div>
+                    <div className="font-mono text-2xl text-white/90">
+                      {fmtTime(progress.jumpBest)}<span className="ml-1 text-xs text-white/50">秒</span>
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between gap-2 border-t border-white/10 px-4 py-3">
+                    <span className="text-[10px] text-white/45">←→ 移動 ／ Space ジャンプ ／ X は？</span>
+                    <button
+                      onClick={startJumpRun}
+                      className="flex items-center gap-2 rounded-sm border px-6 py-2 text-xs tracking-[0.25em] transition hover:shadow-[0_0_24px_rgba(255,255,255,0.25)]"
+                      style={{ ...DISPLAY, borderColor: '#5eead4', color: '#5eead4' }}
+                    >
+                      開始 <ChevronRight className="h-4 w-4" />
+                    </button>
+                  </div>
+                </>
+              )}
             </div>
           )}
 
@@ -413,7 +432,7 @@ export default function DanmakuGame() {
                 <Play className="h-4 w-4" /> 再開
               </button>
               <button onClick={toSelect} className="flex w-44 items-center justify-center gap-2 rounded-sm border border-white/20 py-2 text-sm text-white/70 hover:bg-white/10">
-                <RotateCcw className="h-4 w-4" /> ステージ選択へ
+                <RotateCcw className="h-4 w-4" /> モード選択へ
               </button>
               <button onClick={toTitle} className="flex w-44 items-center justify-center gap-2 rounded-sm border border-white/20 py-2 text-sm text-white/70 hover:bg-white/10">
                 <Home className="h-4 w-4" /> タイトルへ
@@ -424,62 +443,92 @@ export default function DanmakuGame() {
           {/* ── RESULT ──────────────────────────────────── */}
           {screen === 'result' && result && (
             <div className="absolute inset-0 flex flex-col items-center justify-center overflow-y-auto bg-black/80 px-6 py-6 text-center backdrop-blur-[2px]">
-              <div className="text-[10px] tracking-[0.4em]" style={{ color: DIFFS[result.difficulty].color }}>
-                {DIFFS[result.difficulty].label} · {DIFFS[result.difficulty].name}
-              </div>
-              <div
-                className={`mt-1 text-4xl ${result.cleared ? 'bg-gradient-to-b from-white to-pink-300 bg-clip-text text-transparent' : 'text-rose-300'}`}
-                style={DISPLAY}
-              >
-                {result.cleared ? '✝完✝' : 'は？'}
-              </div>
-              <div className="mt-1 text-xs text-white/60" style={MINCHO}>
-                {result.cleared ? 'ALL CLEAR — 来年もある。' : `GAME OVER — ${STAGES[result.stageReached].boss}の✝本質✝に呑まれた`}
-              </div>
-              {result.cleared && (
-                <div className="mt-3 space-y-0.5 text-[11px] text-white/70" style={MINCHO}>
-                  {ENDING_LINES.map((l) => (
-                    <div key={l}>{l}</div>
-                  ))}
-                </div>
-              )}
-              <div className="mt-4 grid w-full max-w-[260px] grid-cols-2 gap-x-4 gap-y-1 text-left text-xs">
-                <span className="text-white/50">SCORE</span>
-                <span className="text-right font-mono text-amber-200">{result.score.toLocaleString()}</span>
-                <span className="text-white/50">到達</span>
-                <span className="text-right">{result.cleared ? '全ステージ' : `STAGE ${result.stageReached + 1}`}</span>
-                <span className="text-white/50">耐えたフェーズ</span>
-                <span className="text-right font-mono">{result.phasesCleared}</span>
-                <span className="text-white/50">ノーミス</span>
-                <span className="text-right font-mono">{result.noMissPhases}</span>
-                <span className="text-white/50">GRAZE</span>
-                <span className="text-right font-mono">{result.graze}</span>
-                <span className="text-white/50">被弾 ／「は？」</span>
-                <span className="text-right font-mono">{result.misses} ／ {result.bombsUsed}</span>
-              </div>
-              <div className="mt-4 border-y border-white/10 py-2">
-                <div className="text-[10px] text-white/50">あなたの✝本質✝偏差値</div>
-                <div className="text-3xl text-white" style={DISPLAY}>{honshitsuHensachi(result).toFixed(1)}</div>
-              </div>
-              {newUnlock >= 0 && (
-                <div className="mt-3 rounded-sm border px-3 py-1.5 text-xs" style={{ borderColor: DIFFS[newUnlock].color, color: DIFFS[newUnlock].color }}>
-                  難易度「{DIFFS[newUnlock].name}（偏差値{DIFFS[newUnlock].hensachi}）」解禁
-                </div>
+              {result.kind === 'jump' ? (
+                <>
+                  <div className="text-[10px] tracking-[0.4em] text-teal-300/80">ENDLESS · 無限ジャンプ</div>
+                  <div className="mt-1 text-4xl text-rose-300" style={DISPLAY}>は？</div>
+                  <div className="mt-1 text-xs text-white/60" style={MINCHO}>GAME OVER — WAVE {result.wave + 1} で落ちた</div>
+                  <div className="mt-4 grid w-full max-w-[260px] grid-cols-2 gap-x-4 gap-y-1 text-left text-xs">
+                    <span className="text-white/50">SCORE</span>
+                    <span className="text-right font-mono text-amber-200">{result.score.toLocaleString()}</span>
+                    <span className="text-white/50">生存時間</span>
+                    <span className="text-right font-mono">{fmtTime(result.frames)} 秒</span>
+                    <span className="text-white/50">到達WAVE</span>
+                    <span className="text-right font-mono">{result.wave + 1}</span>
+                    <span className="text-white/50">GRAZE</span>
+                    <span className="text-right font-mono">{result.graze}</span>
+                    <span className="text-white/50">被弾 ／「は？」</span>
+                    <span className="text-right font-mono">{result.misses} ／ {result.bombsUsed}</span>
+                  </div>
+                  <div className="mt-4 border-y border-white/10 py-2">
+                    <div className="text-[10px] text-white/50">HI SCORE ／ 最長生存</div>
+                    <div className="text-lg text-white" style={DISPLAY}>
+                      <span className="font-mono text-amber-200">{progress.jumpHi.toLocaleString()}</span>
+                      <span className="mx-2 text-white/30">／</span>
+                      <span className="font-mono">{fmtTime(progress.jumpBest)} 秒</span>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="text-[10px] tracking-[0.4em]" style={{ color: DIFFS[result.difficulty].color }}>
+                    {DIFFS[result.difficulty].label} · {DIFFS[result.difficulty].name}
+                  </div>
+                  <div
+                    className={`mt-1 text-4xl ${result.cleared ? 'bg-gradient-to-b from-white to-pink-300 bg-clip-text text-transparent' : 'text-rose-300'}`}
+                    style={DISPLAY}
+                  >
+                    {result.cleared ? '✝完✝' : 'は？'}
+                  </div>
+                  <div className="mt-1 text-xs text-white/60" style={MINCHO}>
+                    {result.cleared ? 'ALL CLEAR — 来年もある。' : `GAME OVER — ${STAGES[Math.min(result.stageReached, N_STAGES - 1)].boss}の✝本質✝に呑まれた`}
+                  </div>
+                  {result.cleared && (
+                    <div className="mt-3 space-y-0.5 text-[11px] text-white/70" style={MINCHO}>
+                      {ENDING_LINES.map((l) => (
+                        <div key={l}>{l}</div>
+                      ))}
+                    </div>
+                  )}
+                  <div className="mt-4 grid w-full max-w-[260px] grid-cols-2 gap-x-4 gap-y-1 text-left text-xs">
+                    <span className="text-white/50">SCORE</span>
+                    <span className="text-right font-mono text-amber-200">{result.score.toLocaleString()}</span>
+                    <span className="text-white/50">到達</span>
+                    <span className="text-right">{result.cleared ? '全ステージ' : `STAGE ${result.stageReached + 1}`}</span>
+                    <span className="text-white/50">耐えたフェーズ</span>
+                    <span className="text-right font-mono">{result.phasesCleared}</span>
+                    <span className="text-white/50">ノーミス</span>
+                    <span className="text-right font-mono">{result.noMissPhases}</span>
+                    <span className="text-white/50">GRAZE</span>
+                    <span className="text-right font-mono">{result.graze}</span>
+                    <span className="text-white/50">被弾 ／「は？」</span>
+                    <span className="text-right font-mono">{result.misses} ／ {result.bombsUsed}</span>
+                  </div>
+                  <div className="mt-4 border-y border-white/10 py-2">
+                    <div className="text-[10px] text-white/50">あなたの✝本質✝偏差値</div>
+                    <div className="text-3xl text-white" style={DISPLAY}>{honshitsuHensachi(result).toFixed(1)}</div>
+                  </div>
+                  {newUnlock >= 0 && (
+                    <div className="mt-3 rounded-sm border px-3 py-1.5 text-xs" style={{ borderColor: DIFFS[newUnlock].color, color: DIFFS[newUnlock].color }}>
+                      難易度「{DIFFS[newUnlock].name}（偏差値{DIFFS[newUnlock].hensachi}）」解禁
+                    </div>
+                  )}
+                </>
               )}
               <div className="mt-5 flex flex-col gap-2">
                 <button onClick={retry} className="flex w-52 items-center justify-center gap-2 rounded-sm border border-white/60 py-2 text-sm hover:bg-white/10">
                   <RotateCcw className="h-4 w-4" />
-                  {result.cleared ? 'もう一度最初から' : 'このステージから再挑戦'}
+                  {result.kind === 'jump' ? 'もう一度' : result.cleared ? 'もう一度最初から' : '最初から再挑戦'}
                 </button>
                 <button onClick={toSelect} className="flex w-52 items-center justify-center gap-2 rounded-sm border border-white/20 py-2 text-sm text-white/70 hover:bg-white/10">
-                  <ChevronRight className="h-4 w-4" /> ステージ選択
+                  <ChevronRight className="h-4 w-4" /> モード選択
                 </button>
               </div>
             </div>
           )}
 
-          {/* ── Touch bomb ──────────────────────────────── */}
-          {isTouch && screen === 'playing' && (
+          {/* ── Touch controls ──────────────────────────── */}
+          {isTouch && screen === 'playing' && kind === 'stage' && (
             <button
               onPointerDown={(e) => {
                 e.preventDefault();
@@ -491,6 +540,47 @@ export default function DanmakuGame() {
             >
               は？
             </button>
+          )}
+          {isTouch && screen === 'playing' && kind === 'jump' && (
+            <>
+              <div className="absolute bottom-9 left-3 flex gap-2">
+                <button
+                  onPointerDown={(e) => { e.preventDefault(); engineRef.current?.setMoveDir(-1); }}
+                  onPointerUp={() => engineRef.current?.setMoveDir(0)}
+                  onPointerLeave={() => engineRef.current?.setMoveDir(0)}
+                  onPointerCancel={() => engineRef.current?.setMoveDir(0)}
+                  className="flex h-16 w-16 items-center justify-center rounded-full border-2 border-white/60 bg-black/40 text-2xl text-white active:scale-90"
+                >
+                  ◀
+                </button>
+                <button
+                  onPointerDown={(e) => { e.preventDefault(); engineRef.current?.setMoveDir(1); }}
+                  onPointerUp={() => engineRef.current?.setMoveDir(0)}
+                  onPointerLeave={() => engineRef.current?.setMoveDir(0)}
+                  onPointerCancel={() => engineRef.current?.setMoveDir(0)}
+                  className="flex h-16 w-16 items-center justify-center rounded-full border-2 border-white/60 bg-black/40 text-2xl text-white active:scale-90"
+                >
+                  ▶
+                </button>
+              </div>
+              <button
+                onPointerDown={(e) => { e.preventDefault(); engineRef.current?.requestBomb(); }}
+                className="absolute bottom-32 right-4 flex h-12 w-12 items-center justify-center rounded-full border-2 border-white/60 bg-rose-900/50 text-base text-white active:scale-90"
+                style={DISPLAY}
+              >
+                は？
+              </button>
+              <button
+                onPointerDown={(e) => { e.preventDefault(); engineRef.current?.jumpDown(true); }}
+                onPointerUp={() => engineRef.current?.jumpDown(false)}
+                onPointerLeave={() => engineRef.current?.jumpDown(false)}
+                onPointerCancel={() => engineRef.current?.jumpDown(false)}
+                className="absolute bottom-9 right-3 flex h-20 w-20 items-center justify-center rounded-full border-2 border-teal-200/80 bg-teal-900/40 text-2xl text-white active:scale-90"
+                style={DISPLAY}
+              >
+                跳
+              </button>
+            </>
           )}
         </div>
       </div>

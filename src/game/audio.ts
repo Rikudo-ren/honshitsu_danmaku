@@ -367,6 +367,14 @@ export class GameAudio {
     this.tShot = now;
     this.noiseHit('bandpass', 2600 + Math.random() * 800, 1400, 0.05, 0.035, 2);
   }
+  /** 無限ジャンプ：跳ぶ */
+  jump(): void {
+    if (!this.ok()) return;
+    const now = this.ctx!.currentTime;
+    if (now - this.tGraze < 0.03) return;
+    this.tGraze = now;
+    this.blip('triangle', 360, 760, 0.075, 0.055);
+  }
   item(): void {
     if (!this.ok()) return;
     const now = this.ctx!.currentTime;

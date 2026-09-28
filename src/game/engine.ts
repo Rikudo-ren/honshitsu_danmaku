@@ -8,14 +8,19 @@
 import {
   W, H, TAU, TYPE_HIT, TYPE_VIS, TYPE_ROT, COLORS, N_COLORS,
   T_SMALL, T_MED, T_LARGE, T_CROSS, T_PETAL,
-  C_RED, C_YELLOW, C_VIOLET, C_PINK, C_WHITE,
+  C_RED, C_YELLOW, C_CYAN, C_VIOLET, C_PINK, C_WHITE,
   B_LINEAR, B_REDIRECT, B_BOUNCE, B_POLAR, B_GRAVITY, B_SINE, B_STEP, B_SPLIT, B_HOMING,
   FL_GRAZED, FL_STOP, FL_FADE, FL_SUPER, FL_NOCULL,
   F_DISPLAY, F_UI, F_MINCHO,
   DIFFS, STAGES, N_STAGES, STAGE_LABELS, POP_TEXTS, POP_MAA, POP_EXTEND, COUNTDOWN, ENDING_LINES,
-  levelOf, spdMul, denMul, rateMul,
+  BOMB_MAX, levelOf, spdMul, denMul, rateMul,
 } from './data';
 import { PATTERNS, attractPattern, type PatternDef } from './patterns';
+import {
+  JUMP_WAVES, N_WAVES, JUMP_PATTERNS,
+  J_GRAV, J_JUMP_V, J_HOLD_ACC, J_HOLD_MAX, J_FALL_MAX, J_MOVE_ACC, J_MOVE_MAX, J_MOVE_FRIC,
+  J_L0, J_L_STEP, J_L_MAX,
+} from './jump';
 import { GameAudio } from './audio';
 import { buildSprites, buildDigits, type SpriteSet, type DigitAtlas, DIGIT_DOT, DIGIT_PLUS } from './sprites';
 
@@ -43,9 +48,15 @@ const K_RING = 2;
 const K_ITEM = 3;
 const K_PETAL = 4;
 
+const BG_JUMP = N_STAGES + 1; // 背景 index（本編 0..5 / タイトル 6 / ジャンプ 7）
+
 export type Mode = 'attract' | 'intro' | 'phase' | 'gap' | 'stageclear' | 'over' | 'ending';
 
+/** ラン種別：通し回避 / 無限ジャンプ */
+export type RunKind = 'stage' | 'jump';
+
 export interface RunResult {
+  kind: RunKind;
   cleared: boolean;
   difficulty: number;
   startStage: number;
@@ -56,6 +67,10 @@ export interface RunResult {
   bombsUsed: number;
   phasesCleared: number;
   noMissPhases: number;
+  /** jump：到達WAVE（0始まり） */
+  wave: number;
+  /** jump：生存フレーム */
+  frames: number;
 }
 
 export interface EngineEvents {
@@ -315,6 +330,14 @@ export class Engine {
   private deathTimer = -1;
   private focus = false;
   private moving = false;
+  // 無限ジャンプ：重力まわり
+  private plVX = 0;
+  private plVY = 0;
+  private jumpHeld = false;
+  private jumpReq = false;
+  private jumpHoldT = 0;
+  private jumpBoost = 0;
+  private airborne = false;
 
   // ── Input ──────────────────────────────────────────────
   private kL = false;
@@ -338,6 +361,10 @@ export class Engine {
   mode: Mode = 'attract';
   private modeT = 0;
   private globalT = 0;
+  kind: RunKind = 'stage';
+  private wave = 0;
+  private jumpT = 0;
+  private waveLabel = 'WAVE 1';
   diff = 0;
   stage = 0;
   phase = 0;
@@ -362,6 +389,12 @@ export class Engine {
   private phaseMissed = false;
   private phaseBombed = false;
   private ended = false;
+
+  // ── Card (現在のステージ/WAVE の見た目) ────────────────
+  private cardGlyph = '✝';
+  private cardColor = '#ffffff';
+  private cardColorIdx = C_WHITE;
+  private cardBoss = '';
 
   // ── Boss ───────────────────────────────────────────────
   bossX = W / 2;
@@ -431,6 +464,8 @@ export class Engine {
     }
     this.bgBase.push(genBase(6, '#8fa0ff'));
     this.bgContour.push(genContour(424242, '#9fb0ff'));
+    this.bgBase.push(genBase(2, '#5eead4'));
+    this.bgContour.push(genContour(717171, '#8ff5e2'));
     this.vignette = genVignette(0, 0, 0, 0.62);
     this.dangerVig = genVignette(255, 20, 60, 0.7);
     if (document.fonts && document.fonts.ready) {
@@ -485,18 +520,32 @@ export class Engine {
     this.playerAlive = false;
     this.bgIdx = 6;
     this.paused = false;
+    this.kind = 'stage';
     this.L = 1;
     this.sp = 1;
     this.dn = 1;
     this.R = 1;
+    this.resetJump();
     this.audio.setMuffle(false);
     this.audio.bgmStart(6, 0);
   }
 
-  startRun(d: number, s: number, hi: number): void {
+  private resetJump(): void {
+    this.plVX = 0;
+    this.plVY = 0;
+    this.jumpHeld = false;
+    this.jumpReq = false;
+    this.jumpHoldT = 0;
+    this.jumpBoost = 0;
+    this.airborne = false;
+  }
+
+  /** 通し回避：常に STAGE 1 から FINAL まで（残機5 ／「は？」5） */
+  startRun(d: number, hi: number): void {
     this.audio.init();
+    this.kind = 'stage';
     this.diff = d;
-    this.startStage = s;
+    this.startStage = 0;
     this.score = 0;
     this.hi = hi;
     this.graze = 0;
@@ -509,6 +558,7 @@ export class Engine {
     this.bombs = DIFFS[d].bombs;
     this.ended = false;
     this.clearAll();
+    this.resetJump();
     this.plX = this.plPX = W / 2;
     this.plY = this.plPY = H - 70;
     for (let i = 0; i < 10; i++) { this.trailX[i] = this.plX; this.trailY[i] = this.plY; }
@@ -516,13 +566,46 @@ export class Engine {
     this.invuln = 0;
     this.deathTimer = -1;
     this.paused = false;
-    this.beginStage(s);
+    this.beginStage(0);
+  }
+
+  /** 無限ジャンプ：重力下でWAVEを延々と回避 */
+  startJump(hi: number): void {
+    this.audio.init();
+    this.kind = 'jump';
+    this.diff = 0;
+    this.startStage = 0;
+    this.wave = 0;
+    this.jumpT = 0;
+    this.score = 0;
+    this.hi = hi;
+    this.graze = 0;
+    this.gauge = 0;
+    this.misses = 0;
+    this.bombsUsed = 0;
+    this.phasesCleared = 0;
+    this.noMissPhases = 0;
+    this.lives = DIFFS[0].lives;
+    this.bombs = BOMB_MAX;
+    this.ended = false;
+    this.clearAll();
+    this.resetJump();
+    this.plX = this.plPX = W / 2;
+    this.plY = this.plPY = H * 0.55;
+    for (let i = 0; i < 10; i++) { this.trailX[i] = this.plX; this.trailY[i] = this.plY; }
+    this.playerAlive = true;
+    this.invuln = 60;
+    this.deathTimer = -1;
+    this.paused = false;
+    this.audio.bgmStart(4, 1);
+    this.beginJumpWave(0);
   }
 
   setPaused(p: boolean): void {
     if (!this.isPlaying()) return;
     this.paused = p;
     this.kL = this.kR = this.kU = this.kD = this.kF = false;
+    this.jumpHeld = false;
     this.dragId = -1;
     this.activePointers = 0;
     if (p) this.audio.suspend();
@@ -534,6 +617,19 @@ export class Engine {
 
   requestBomb(): void {
     this.bombReq = true;
+  }
+
+  /** タッチ操作：左右 */
+  setMoveDir(d: number): void {
+    this.kL = d < 0;
+    this.kR = d > 0;
+  }
+
+  /** タッチ操作：ジャンプ（押した瞬間に跳ぶ／押し続けると伸びる） */
+  jumpDown(on: boolean): void {
+    if (this.kind !== 'jump') return;
+    if (on && !this.jumpHeld) this.jumpReq = true;
+    this.jumpHeld = on;
   }
 
   isPlaying(): boolean {
@@ -683,6 +779,10 @@ export class Engine {
     this.mode = 'intro';
     this.modeT = 0;
     this.bgIdx = s;
+    this.cardGlyph = STAGES[s].glyph;
+    this.cardColor = STAGES[s].color;
+    this.cardColorIdx = STAGES[s].colorIdx;
+    this.cardBoss = STAGES[s].boss;
     this.bossVisible = true;
     this.bossX = this.bossPX = W / 2;
     this.bossY = this.bossPY = -80;
@@ -732,6 +832,72 @@ export class Engine {
     this.R = rateMul(this.L);
   }
 
+  // ── 無限ジャンプ：WAVE（フェーズ相当）───────────────
+  private beginJumpWave(w: number): void {
+    const def = JUMP_WAVES[w % N_WAVES];
+    this.wave = w;
+    this.waveLabel = 'WAVE ' + (w + 1);
+    this.stage = 0;
+    this.phase = 0;
+    this.mode = 'phase';
+    this.modeT = 0;
+    this.phaseT = 0;
+    this.phaseDur = def.dur * 60;
+    this.tmr.fill(0.999);
+    this.cnt.fill(0);
+    this.fv.fill(0);
+    this.seed = ((w * 2654435761 + 12345) >>> 0) | 1;
+    this.wander = false;
+    this.wellOn = false;
+    this.emitN = 0;
+    this.emitLink = false;
+    this.stepF = 1;
+    this.petals = false;
+    this.timeStop = 0;
+    this.phaseMissed = false;
+    this.phaseBombed = false;
+    this.cardGlyph = def.glyph;
+    this.cardColor = def.color;
+    this.cardColorIdx = def.colorIdx;
+    this.cardBoss = def.boss;
+    this.bgIdx = BG_JUMP;
+    this.bossVisible = true;
+    this.bossX = this.bossPX = W / 2;
+    this.bossY = this.bossPY = 96;
+    this.updateJumpLevel();
+    this.pattern = JUMP_PATTERNS[def.id] ?? null;
+    if (this.pattern && this.pattern.init) this.pattern.init(this, this.L);
+    this.cutinT = w === 0 ? 0 : -1;
+    this.ctx.font = FONT_PHASE;
+    this.phaseNameW = this.ctx.measureText(def.name).width;
+    this.audio.setIntensity(Math.min(3, 1 + Math.floor(w / 2)));
+  }
+
+  private updateJumpLevel(): void {
+    const f = Math.min(1, this.phaseT / this.phaseDur);
+    this.L = Math.min(J_L_MAX, J_L0 + this.wave * J_L_STEP + f * 0.03);
+    this.sp = spdMul(this.L);
+    this.dn = denMul(this.L);
+    this.R = rateMul(this.L);
+  }
+
+  private clearJumpWave(): void {
+    const bonus = 20000 + this.wave * 4000;
+    this.score += bonus;
+    this.bannerVal = bonus;
+    this.bannerClean = true;
+    this.phasesCleared++;
+    this.startCancel(this.plX, this.plY, false, 10);
+    this.mode = 'gap';
+    this.modeT = 0;
+    this.wellOn = false;
+    this.emitN = 0;
+    this.audio.clear();
+    this.flash = 0.3;
+    this.flashRed = false;
+    this.shake = 5;
+  }
+
   private clearPhase(): void {
     const clean = !this.phaseMissed && !this.phaseBombed;
     const bonus = (clean ? 100000 : 30000) * (this.stage + 1) * (this.diff + 1);
@@ -757,6 +923,10 @@ export class Engine {
   }
 
   private nextAfterGap(): void {
+    if (this.kind === 'jump') {
+      this.beginJumpWave(this.wave + 1);
+      return;
+    }
     const st = STAGES[this.stage];
     if (this.phase + 1 < st.phases.length) {
       this.beginPhase(this.phase + 1);
@@ -783,6 +953,7 @@ export class Engine {
     if (this.ended) return;
     this.ended = true;
     this.events.onEnd({
+      kind: this.kind,
       cleared,
       difficulty: this.diff,
       startStage: this.startStage,
@@ -793,6 +964,8 @@ export class Engine {
       bombsUsed: this.bombsUsed,
       phasesCleared: this.phasesCleared,
       noMissPhases: this.noMissPhases,
+      wave: this.wave,
+      frames: this.jumpT,
     });
   }
 
@@ -838,11 +1011,16 @@ export class Engine {
       }
       return;
     }
-    this.bombs = Math.max(this.bombs, DIFFS[this.diff].bombs);
     this.invuln = 180;
     this.gauge = Math.floor(this.gauge * 0.5);
-    this.plX = this.plPX = W / 2;
-    this.plY = this.plPY = H - 60;
+    if (this.kind === 'jump') {
+      this.resetJump();
+      this.plX = this.plPX = W / 2;
+      this.plY = this.plPY = H * 0.52;
+    } else {
+      this.plX = this.plPX = W / 2;
+      this.plY = this.plPY = H - 60;
+    }
     this.addP(K_RING, this.plX, this.plY, -1.2, 0, 40, 60, C_PINK);
   }
 
@@ -874,7 +1052,7 @@ export class Engine {
     this.audio.graze();
     if (this.gauge >= GAUGE_MAX) {
       this.gauge = 0;
-      if (this.bombs < 7) this.bombs++;
+      if (this.bombs < BOMB_MAX) this.bombs++;
       this.addPop(this.plX, this.plY - 40, 0, POP_MAA);
       this.addPop(this.plX, this.plY - 22, 0, POP_EXTEND);
       this.audio.extend();
@@ -941,9 +1119,18 @@ export class Engine {
         break;
       case 'phase':
         this.phaseT++;
-        this.updateLevel();
+        if (this.kind === 'jump') {
+          this.jumpT++;
+          this.score += 6 + (this.wave >> 1);
+          this.updateJumpLevel();
+        } else {
+          this.updateLevel();
+        }
         if (this.pattern && this.phaseT >= WARM) this.pattern.update(this, this.phaseT - WARM, this.L);
-        if (this.phaseT >= this.phaseDur) this.clearPhase();
+        if (this.phaseT >= this.phaseDur) {
+          if (this.kind === 'jump') this.clearJumpWave();
+          else this.clearPhase();
+        }
         break;
       case 'gap':
         if (this.modeT >= GAP) this.nextAfterGap();
@@ -1009,6 +1196,10 @@ export class Engine {
       this.bombReq = false;
       if (this.mode !== 'ending') this.doBomb();
     }
+    if (this.kind === 'jump') {
+      this.updateJumpPlayer();
+      return;
+    }
     this.focus = this.kF;
     let dx = (this.kR ? 1 : 0) - (this.kL ? 1 : 0);
     let dy = (this.kD ? 1 : 0) - (this.kU ? 1 : 0);
@@ -1029,6 +1220,57 @@ export class Engine {
     let y = this.plY + my;
     if (x < 8) x = 8; else if (x > W - 8) x = W - 8;
     if (y < 14) y = 14; else if (y > H - 12) y = H - 12;
+    this.plX = x;
+    this.plY = y;
+    if (this.invuln > 0) this.invuln--;
+    this.trailHead = (this.trailHead + 1) % 10;
+    this.trailX[this.trailHead] = x;
+    this.trailY[this.trailHead] = y;
+  }
+
+  /** 無限ジャンプ：常に落ちる。左右＋Space（押し込みで跳躍力が伸びる／空中でも跳べる） */
+  private updateJumpPlayer(): void {
+    // 跳ぶ（押した瞬間に即座に発動）
+    if (this.jumpReq) {
+      this.jumpReq = false;
+      this.plVY = -J_JUMP_V;
+      this.jumpHoldT = 0;
+      this.jumpBoost = 0;
+      this.airborne = true;
+      this.burst(this.plX, this.plY + 6, 5, C_CYAN, 1.6, 1.1);
+      this.audio.jump();
+    }
+    if (this.airborne && this.jumpHeld && this.jumpHoldT < J_HOLD_MAX && this.plVY < 0) {
+      this.plVY -= J_HOLD_ACC;
+      this.jumpHoldT++;
+      this.jumpBoost = this.jumpHoldT;
+    }
+    // 重力
+    this.plVY += J_GRAV;
+    if (this.plVY > J_FALL_MAX) this.plVY = J_FALL_MAX;
+    // 左右
+    let ax = 0;
+    if (this.kL) ax -= 1;
+    if (this.kR) ax += 1;
+    if (ax !== 0) this.plVX += ax * J_MOVE_ACC;
+    else this.plVX *= J_MOVE_FRIC;
+    if (this.plVX > J_MOVE_MAX) this.plVX = J_MOVE_MAX;
+    else if (this.plVX < -J_MOVE_MAX) this.plVX = -J_MOVE_MAX;
+    // タッチのドラッグは直接加算
+    let mx = this.plVX + this.dragDX * 0.35;
+    let my = this.plVY + this.dragDY * 0.6;
+    this.dragDX = 0;
+    this.dragDY = 0;
+    if (mx > 26) mx = 26; else if (mx < -26) mx = -26;
+    if (my > 26) my = 26; else if (my < -26) my = -26;
+    this.moving = mx !== 0 || my !== 0;
+    let x = this.plX + mx;
+    let y = this.plY + my;
+    // 画面は壁。地面はない（下辺に着いても立たない＝すぐまた跳べる）
+    if (x < 9) { x = 9; this.plVX = 0; }
+    else if (x > W - 9) { x = W - 9; this.plVX = 0; }
+    if (y < 24) { y = 24; if (this.plVY < 0) this.plVY = 0; this.airborne = false; }
+    else if (y > H - 16) { y = H - 16; if (this.plVY > 0) this.plVY = 0; this.airborne = false; }
     this.plX = x;
     this.plY = y;
     if (this.invuln > 0) this.invuln--;
@@ -1101,7 +1343,7 @@ export class Engine {
             y += sn * s;
             if (this.b0[i] > 0) {
               if ((x < 4 && c < 0) || (x > W - 4 && c > 0)) { a = Math.PI - a; this.b0[i]--; }
-              else if (y < 4 && sn < 0) { a = -a; this.b0[i]--; }
+              else if ((y < 4 && sn < 0) || (y > H - 4 && sn > 0)) { a = -a; this.b0[i]--; }
             }
             break;
           }
@@ -1420,8 +1662,17 @@ export class Engine {
       case 'ArrowUp': case 'KeyW': this.kU = true; break;
       case 'ArrowDown': case 'KeyS': this.kD = true; break;
       case 'ShiftLeft': case 'ShiftRight': this.kF = true; break;
-      case 'KeyX': case 'Space': case 'KeyC':
+      case 'KeyX': case 'KeyC':
         if (!e.repeat && !this.paused) this.bombReq = true;
+        break;
+      case 'Space':
+        // 無限ジャンプでは Space = 跳ぶ（押した長さで跳躍力が変わる）
+        if (this.kind === 'jump') {
+          if (!e.repeat) this.jumpReq = true;
+          this.jumpHeld = true;
+        } else if (!e.repeat && !this.paused) {
+          this.bombReq = true;
+        }
         break;
       case 'Escape': case 'KeyP':
         if (!e.repeat && this.isPlaying() && this.mode !== 'over' && !this.ended) {
@@ -1443,11 +1694,13 @@ export class Engine {
       case 'ArrowUp': case 'KeyW': this.kU = false; break;
       case 'ArrowDown': case 'KeyS': this.kD = false; break;
       case 'ShiftLeft': case 'ShiftRight': this.kF = false; break;
+      case 'Space': this.jumpHeld = false; break;
     }
   };
 
   private onBlur = (): void => {
     this.kL = this.kR = this.kU = this.kD = this.kF = false;
+    this.jumpHeld = false;
   };
 
   private onVis = (): void => {
@@ -1675,14 +1928,13 @@ export class Engine {
 
   private drawBoss(alpha: number): void {
     const c = this.ctx;
-    const st = STAGES[this.stage];
     const x = this.bossPX + (this.bossX - this.bossPX) * alpha;
     const y = this.bossPY + (this.bossY - this.bossPY) * alpha;
-    const col = this.mode === 'attract' ? '#ffffff' : st.color;
+    const col = this.mode === 'attract' ? '#ffffff' : this.cardColor;
     const rot = this.bossRot;
     c.globalCompositeOperation = 'lighter';
     c.globalAlpha = 0.55;
-    c.drawImage(this.sprites.glow[st.colorIdx], x - 70, y - 70, 140, 140);
+    c.drawImage(this.sprites.glow[this.cardColorIdx], x - 70, y - 70, 140, 140);
     c.strokeStyle = col;
     c.lineWidth = 1.1;
     c.globalAlpha = 0.7;
@@ -1718,7 +1970,7 @@ export class Engine {
     c.fillStyle = '#ffffff';
     c.shadowColor = col;
     c.shadowBlur = 12;
-    c.fillText(st.glyph, x, y + 1);
+    c.fillText(this.cardGlyph, x, y + 1);
     c.shadowBlur = 0;
     if (this.mode === 'phase') {
       const rem = 1 - this.phaseT / this.phaseDur;
@@ -1816,6 +2068,26 @@ export class Engine {
     c.drawImage(this.sprites.glowCrimson, x - 20, y - 20, 40, 40);
     c.globalCompositeOperation = 'source-over';
     c.globalAlpha = baseA;
+    if (this.kind === 'jump') {
+      // 押し込みが効いている間の噴き
+      if (this.jumpBoost > 0) {
+        const r = 10 + this.jumpBoost * 1.3;
+        c.globalCompositeOperation = 'lighter';
+        c.globalAlpha = (0.22 + this.jumpBoost * 0.028) * baseA;
+        c.drawImage(this.sprites.glow[C_CYAN], x - r, y + 6 - r * 0.7, r * 2, r * 1.5);
+        c.globalCompositeOperation = 'source-over';
+        c.globalAlpha = baseA;
+      }
+      // 横移動の気配
+      if (this.plVX !== 0) {
+        const off = -this.plVX * 2.4;
+        c.globalCompositeOperation = 'lighter';
+        c.globalAlpha = 0.2 * baseA;
+        c.drawImage(this.sprites.glowCrimson, x + off - 16, y - 16, 32, 32);
+        c.globalCompositeOperation = 'source-over';
+        c.globalAlpha = baseA;
+      }
+    }
     // 三重県臣：えんじのネクタイ
     c.fillStyle = '#7d0f2a';
     c.strokeStyle = '#ffd3dc';
@@ -1846,7 +2118,7 @@ export class Engine {
     const c = this.ctx;
     const x = this.plPX + (this.plX - this.plPX) * alpha;
     const y = this.plPY + (this.plY - this.plPY) * alpha;
-    if (this.focus || this.touchActive) {
+    if (this.focus || this.touchActive || this.kind === 'jump') {
       const rot = this.globalT * 0.06;
       c.strokeStyle = '#ffffff';
       c.lineWidth = 1;
@@ -2048,7 +2320,10 @@ export class Engine {
 
   private drawCutin(): void {
     const c = this.ctx;
-    const st = STAGES[this.stage];
+    const jump = this.kind === 'jump';
+    const color = jump ? this.cardColor : STAGES[this.stage].color;
+    const glyph = jump ? this.cardGlyph : STAGES[this.stage].glyph;
+    const phaseName = jump ? JUMP_WAVES[this.wave % N_WAVES].name : STAGES[this.stage].phases[this.phase].name;
     const t = this.cutinT;
     const inE = t < 16 ? easeOut(t / 16) : 1;
     const outE = t > 86 ? (t - 86) / 24 : 0;
@@ -2064,7 +2339,7 @@ export class Engine {
     c.lineTo(-10 + slide, yc + 58);
     c.closePath();
     c.fill();
-    c.strokeStyle = st.color;
+    c.strokeStyle = color;
     c.lineWidth = 1.5;
     c.globalAlpha = a;
     c.beginPath();
@@ -2077,21 +2352,21 @@ export class Engine {
     c.textBaseline = 'middle';
     c.globalAlpha = 0.16 * a;
     c.font = FONT_CUT_BIG;
-    c.fillStyle = st.color;
-    c.fillText(st.glyph, W * 0.78 + slide * 1.4 - t * 0.3, yc + 6);
+    c.fillStyle = color;
+    c.fillText(glyph, W * 0.78 + slide * 1.4 - t * 0.3, yc + 6);
     c.globalAlpha = a;
     c.font = FONT_CUT_SUB;
-    c.fillStyle = st.color;
+    c.fillStyle = color;
     c.fillText('✝ 本 質 カ ー ド ✝', W / 2 + slide, yc - 24);
     c.font = FONT_CUT_NAME;
     c.fillStyle = '#ffffff';
-    c.shadowColor = st.color;
+    c.shadowColor = color;
     c.shadowBlur = 14;
-    c.fillText(st.phases[this.phase].name, W / 2 + slide * 0.8, yc + 4);
+    c.fillText(phaseName, W / 2 + slide * 0.8, yc + 4);
     c.shadowBlur = 0;
     c.font = FONT_CUT_SUB;
     c.fillStyle = 'rgba(255,255,255,0.7)';
-    c.fillText(BOSS_HUD[this.stage], W / 2 + slide * 0.6, yc + 32);
+    c.fillText(this.cardBoss, W / 2 + slide * 0.6, yc + 32);
     c.globalAlpha = 1;
   }
 
@@ -2118,6 +2393,92 @@ export class Engine {
   }
 
   private drawHUD(): void {
+    if (this.kind === 'jump') this.drawJumpHUD();
+    else this.drawStageHUD();
+    this.drawStock();
+  }
+
+  /** 残機 ／「は？」／ GRAZE ／ まあゲージ（両モード共通） */
+  private drawStock(): void {
+    const c = this.ctx;
+    c.globalAlpha = 1;
+    const by = H - 14;
+    for (let k = 0; k < this.lives && k < 9; k++) {
+      const x = 16 + k * 14;
+      c.fillStyle = '#9b1236';
+      c.strokeStyle = '#ffd3dc';
+      c.lineWidth = 0.8;
+      c.beginPath();
+      c.moveTo(x, by - 22);
+      c.lineTo(x + 4.5, by - 15);
+      c.lineTo(x, by - 8);
+      c.lineTo(x - 4.5, by - 15);
+      c.closePath();
+      c.fill();
+      c.stroke();
+    }
+    c.font = FONT_BOMBCHIP;
+    c.textAlign = 'center';
+    c.textBaseline = 'middle';
+    for (let k = 0; k < this.bombs && k < 9; k++) {
+      const x = 16 + k * 16;
+      c.fillStyle = '#ffffff';
+      c.beginPath();
+      c.arc(x, by, 6.5, 0, TAU);
+      c.fill();
+      c.fillStyle = '#7d0f2a';
+      c.fillText('は', x, by + 0.5);
+    }
+    c.textBaseline = 'alphabetic';
+    c.textAlign = 'right';
+    c.font = FONT_HUD_S;
+    c.fillStyle = 'rgba(255,255,255,0.55)';
+    c.fillText('GRAZE', W - 10, H - 36);
+    this.drawNum(this.digits, this.graze, W - 10, H - 34, 12, 1, 0);
+    const gw = 96;
+    c.fillStyle = 'rgba(255,255,255,0.12)';
+    c.fillRect(W - 10 - gw, H - 14, gw, 5);
+    c.fillStyle = '#ff6b9a';
+    c.fillRect(W - 10 - gw, H - 14, (gw * this.gauge) / GAUGE_MAX, 5);
+    c.fillStyle = 'rgba(255,255,255,0.6)';
+    c.fillText('まあ', W - 14 - gw, H - 8);
+    c.textAlign = 'left';
+  }
+
+  /** 無限ジャンプ：生存時間 ／ WAVE ／ スコア */
+  private drawJumpHUD(): void {
+    const c = this.ctx;
+    c.globalAlpha = 1;
+    c.textBaseline = 'alphabetic';
+    // WAVE 進行（上端の細いバー）
+    if (this.mode === 'phase') {
+      const frac = Math.max(0, 1 - this.phaseT / this.phaseDur);
+      c.fillStyle = this.cardColor;
+      c.fillRect(0, 0, W * frac, 3);
+    }
+    // 生存時間
+    this.drawNum(this.digits, this.jumpT / 60, W / 2, 6, 22, 2, 1);
+    // スコア
+    c.font = FONT_HUD_S;
+    c.textAlign = 'left';
+    c.fillStyle = 'rgba(255,255,255,0.55)';
+    c.fillText('SCORE', 10, 14);
+    this.drawNum(this.gold, this.score, 10, 16, 17, 0, 0);
+    c.fillStyle = 'rgba(255,255,255,0.45)';
+    c.fillText('HI', 10, 45);
+    this.drawNum(this.digits, Math.max(this.hi, this.score), 24, 36, 11, 0, 0);
+    // WAVE
+    c.textAlign = 'right';
+    c.font = FONT_HUD_M;
+    c.fillStyle = this.cardColor;
+    c.fillText(this.waveLabel, W - 10, 16);
+    c.font = FONT_HUD_S;
+    c.fillStyle = 'rgba(255,255,255,0.55)';
+    c.fillText(this.cardBoss, W - 10, 30);
+    c.textAlign = 'left';
+  }
+
+  private drawStageHUD(): void {
     const c = this.ctx;
     const st = STAGES[this.stage];
     const d = DIFFS[this.diff];
@@ -2166,50 +2527,6 @@ export class Engine {
     this.drawNum(this.digits, this.L, W - 10, 26, 13, 1, 2);
     c.textAlign = 'left';
     c.fillText(STAGE_LABELS[this.stage], 10, 58);
-    // 残機
-    const by = H - 14;
-    for (let k = 0; k < this.lives && k < 9; k++) {
-      const x = 16 + k * 14;
-      c.fillStyle = '#9b1236';
-      c.strokeStyle = '#ffd3dc';
-      c.lineWidth = 0.8;
-      c.beginPath();
-      c.moveTo(x, by - 22);
-      c.lineTo(x + 4.5, by - 15);
-      c.lineTo(x, by - 8);
-      c.lineTo(x - 4.5, by - 15);
-      c.closePath();
-      c.fill();
-      c.stroke();
-    }
-    // 「は？」ストック
-    c.font = FONT_BOMBCHIP;
-    c.textAlign = 'center';
-    c.textBaseline = 'middle';
-    for (let k = 0; k < this.bombs && k < 9; k++) {
-      const x = 16 + k * 16;
-      c.fillStyle = '#ffffff';
-      c.beginPath();
-      c.arc(x, by, 6.5, 0, TAU);
-      c.fill();
-      c.fillStyle = '#7d0f2a';
-      c.fillText('は', x, by + 0.5);
-    }
-    // グレイズ & まあゲージ
-    c.textBaseline = 'alphabetic';
-    c.textAlign = 'right';
-    c.font = FONT_HUD_S;
-    c.fillStyle = 'rgba(255,255,255,0.55)';
-    c.fillText('GRAZE', W - 10, H - 36);
-    this.drawNum(this.digits, this.graze, W - 10, H - 34, 12, 1, 0);
-    const gw = 96;
-    c.fillStyle = 'rgba(255,255,255,0.12)';
-    c.fillRect(W - 10 - gw, H - 14, gw, 5);
-    c.fillStyle = '#ff6b9a';
-    c.fillRect(W - 10 - gw, H - 14, (gw * this.gauge) / GAUGE_MAX, 5);
-    c.fillStyle = 'rgba(255,255,255,0.6)';
-    c.fillText('まあ', W - 14 - gw, H - 8);
-    c.textAlign = 'left';
   }
 
   private drawIntro(): void {
@@ -2260,13 +2577,13 @@ export class Engine {
     c.textBaseline = 'middle';
     c.font = FONT_BANNER;
     c.fillStyle = '#ffffff';
-    c.shadowColor = STAGES[this.stage].color;
+    c.shadowColor = this.cardColor;
     c.shadowBlur = 18;
-    c.fillText('✝本質回避✝', W / 2, 250);
+    c.fillText(this.kind === 'jump' ? 'WAVE CLEAR' : '✝本質回避✝', W / 2, 250);
     c.shadowBlur = 0;
     c.font = FONT_HUD_M;
     c.fillStyle = this.bannerClean ? '#ffd98a' : 'rgba(255,255,255,0.7)';
-    c.fillText(this.bannerClean ? 'NO MISS BONUS' : 'SURVIVAL BONUS', W / 2, 280);
+    c.fillText(this.kind === 'jump' ? this.waveLabel : this.bannerClean ? 'NO MISS BONUS' : 'SURVIVAL BONUS', W / 2, 280);
     this.drawNumPlus(this.bannerVal, W / 2, 292, 18);
     c.globalAlpha = 1;
   }

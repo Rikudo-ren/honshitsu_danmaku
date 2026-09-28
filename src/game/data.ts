@@ -75,14 +75,33 @@ export interface DifficultyDef {
   readonly lives: number;
   readonly bombs: number;
   readonly color: string;
-  readonly desc: string;
 }
 
+/** 全難易度 残機5 ／「は？」5 */
+export const LIVES = 5;
+export const BOMB_MAX = 5;
+
 export const DIFFS: readonly DifficultyDef[] = [
-  { id: 0, name: '北棟', label: 'EASY', hensachi: 50, lives: 5, bombs: 3, color: '#5eead4', desc: 'コーンスープが三ヶ月補充されない側。まずは✝本質✝の気配に慣れる。' },
-  { id: 1, name: '理数科', label: 'NORMAL', hensachi: 60, lives: 4, bombs: 3, color: '#fbbf24', desc: 'えんじのネクタイ。三年間、同じ四十人。標準的な✝本質✝濃度。' },
-  { id: 2, name: '内進', label: 'HARD', hensachi: 70, lives: 3, bombs: 2, color: '#f472b6', desc: '紺のネクタイ。偏差値十の壁の向こう側。効率では避けきれない。' },
-  { id: 3, name: '数理零', label: 'LUNATIC', hensachi: 85, lives: 3, bombs: 2, color: '#a78bfa', desc: '全科目学年首席。「面白い」としか言わない者だけが立てる領域。' },
+  { id: 0, name: '普通科', label: 'EASY', hensachi: 50, lives: LIVES, bombs: BOMB_MAX, color: '#5eead4' },
+  { id: 1, name: '理数科', label: 'NORMAL', hensachi: 60, lives: LIVES, bombs: BOMB_MAX, color: '#fbbf24' },
+  { id: 2, name: '内進', label: 'HARD', hensachi: 70, lives: LIVES, bombs: BOMB_MAX, color: '#f472b6' },
+  { id: 3, name: '数理零', label: 'LUNATIC', hensachi: 85, lives: LIVES, bombs: BOMB_MAX, color: '#a78bfa' },
+];
+
+// ── Game kinds ─────────────────────────────────────────────
+export type KindId = 'stage' | 'jump';
+
+export interface KindDef {
+  readonly id: KindId;
+  readonly name: string;
+  readonly label: string;
+  readonly color: string;
+  readonly glyph: string;
+}
+
+export const KINDS: readonly KindDef[] = [
+  { id: 'stage', name: '回避弾幕', label: 'DANMAKU', color: '#ff4d6d', glyph: '✝' },
+  { id: 'jump', name: '無限ジャンプ', label: 'ENDLESS', color: '#5eead4', glyph: '跳' },
 ];
 
 /**
@@ -183,11 +202,6 @@ export const STAGES: readonly StageDef[] = [
 export const N_STAGES = STAGES.length;
 export const STAGE_LABELS: readonly string[] = ['STAGE 1', 'STAGE 2', 'STAGE 3', 'STAGE 4', 'STAGE 5', 'FINAL STAGE'];
 
-export function stageLevelRange(d: number, s: number): [number, number] {
-  const last = STAGES[s].phases.length - 1;
-  return [levelOf(d, s, 0, 0), levelOf(d, s, last, 1)];
-}
-
 /** ポップアップ文字列（事前確保：毎フレームの文字列生成ゼロ） */
 export const POP_TEXTS: readonly string[] = ['', 'は？', 'まあ…', '観測', '窓の外の五秒', '見てない', '面白い', '草', '✝本質✝', '「は？」+1'];
 export const POP_HA = 1;
@@ -196,6 +210,7 @@ export const POP_KANSOKU = 3;
 export const POP_WINDOW = 4;
 export const POP_MITENAI = 5;
 export const POP_OMOSHIROI = 6;
+export const POP_HONSHITSU = 8;
 export const POP_EXTEND = 9;
 
 export const COUNTDOWN: readonly string[] = ['', '1', '2', '3', '4', '5'];
@@ -209,19 +224,25 @@ export const ENDING_LINES: readonly string[] = [
 
 // ── Save data ──────────────────────────────────────────────
 export interface Progress {
-  /** 各難易度で到達済みのステージ index（N_STAGES で全クリア） */
+  /** 各難易度で到達済みのステージ index（表示用） */
   reached: number[];
   hi: number[];
+  /** 各難易度をステージ1〜FINALまで通しでクリアした回数 */
   clears: number[];
+  /** 無限ジャンプ：ハイスコア */
+  jumpHi: number;
+  /** 無限ジャンプ：最長生存フレーム */
+  jumpBest: number;
 }
 
-export const SAVE_KEY = 'honshitsu-danmaku-v1';
+export const SAVE_KEY = 'honshitsu-danmaku-v2';
 
 export function defaultProgress(): Progress {
-  return { reached: [0, -1, -1, -1], hi: [0, 0, 0, 0], clears: [0, 0, 0, 0] };
+  return { reached: [-1, -1, -1, -1], hi: [0, 0, 0, 0], clears: [0, 0, 0, 0], jumpHi: 0, jumpBest: 0 };
 }
 
+/** 難易度は「前の難易度を通しでクリア」で解禁 */
 export function isDiffUnlocked(p: Progress, d: number): boolean {
   if (d === 0) return true;
-  return p.reached[d - 1] >= N_STAGES;
+  return p.clears[d - 1] > 0;
 }
