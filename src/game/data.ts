@@ -182,7 +182,6 @@ export const STAGES: readonly StageDef[] = [
   },
 ];
 
-export const N_STAGES = STAGES.length;
 export const STAGE_LABELS: readonly string[] = ['STAGE 1', 'STAGE 2', 'STAGE 3', 'STAGE 4', 'STAGE 5', 'FINAL STAGE'];
 
 // ── 無限ジャンプモード ───────────────────────────────────
