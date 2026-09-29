@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { Maximize2, Volume2, VolumeX, Pause, Play, Lock, ChevronRight, RotateCcw, Home, Trophy, Check, Keyboard, Copy, Image as ImageIcon } from 'lucide-react';
-import { Engine, type RunResult } from './game/engine';
+import { Engine, type ClearShot, type RunResult } from './game/engine';
 import {
   MODES, DIFFS, N_STAGES, N_STAGES_JUMP, STAGE_TABLES, W, H, SAVE_KEY, OLD_SAVE_KEY,
   ENDING_LINES_ALL, defaultProgress, isDiffUnlocked, modeCleared, stageLabel, levelOf,
@@ -155,8 +155,8 @@ export default function DanmakuGame() {
   const [keysFrom, setKeysFrom] = useState<Screen>('title');
   const [size, setSize] = useState({ w: W, h: H });
   const [isTouch] = useState<boolean>(() => typeof window !== 'undefined' && !!window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
-  /** 直近のクリア画像（ステージ／ALL）— リザルト画面で再コピー可 */
-  const [clearShot, setClearShot] = useState<{ url: string; kind: 'stage' | 'all' } | null>(null);
+  /** このランで撮ったクリア画像（ステージクリア × n ＋ ALL CLEAR）。末尾が最新 */
+  const [clearShots, setClearShots] = useState<ClearShot[]>([]);
   const [copyMsg, setCopyMsg] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const toastTimer = useRef<number>(0);
@@ -214,14 +214,13 @@ export default function DanmakuGame() {
         setScreen('result');
       },
       onPause: (p) => setScreen(p ? 'paused' : 'playing'),
-      onClearShot: (url, kind) => {
-        setClearShot({ url, kind });
-        // 自動でクリップボードへ。プレイ中トーストで知らせる
-        void copyImageToClipboard(url).then((r) => {
-          const label = kind === 'all' ? 'ALL CLEAR' : 'STAGE CLEAR';
+      onClearShot: (shot) => {
+        setClearShots((prev) => [...prev, shot]);
+        // 各クリア（ステージ／ALL）で自動的にクリップボードへ。プレイ中トーストで知らせる
+        void copyImageToClipboard(shot.url).then((r) => {
           const msg =
-            r === 'copied' ? `${label} 画像をクリップボードにコピーした`
-              : r === 'downloaded' ? `${label} 画像をダウンロードした`
+            r === 'copied' ? `「${shot.label}」画像をクリップボードにコピーした`
+              : r === 'downloaded' ? `「${shot.label}」画像をダウンロードした`
                 : null;
           if (msg) {
             setToast(msg);
@@ -274,23 +273,22 @@ export default function DanmakuGame() {
     eng.audio.select();
     setNewUnlock(null);
     setResult(null);
-    setClearShot(null);
+    setClearShots([]);
     setCopyMsg(null);
     setToast(null);
     eng.startRun(m, d, progressRef.current.stats[m][d].hi);
     setScreen('playing');
   }, [ensureAudio]);
 
-  const copyClearShot = useCallback(async () => {
-    if (!clearShot) return;
-    const r = await copyImageToClipboard(clearShot.url);
+  const copyClearShot = useCallback(async (shot: ClearShot) => {
+    const r = await copyImageToClipboard(shot.url);
     setCopyMsg(
       r === 'copied' ? 'コピーした'
         : r === 'downloaded' ? 'ダウンロードした'
           : 'コピーできなかった',
     );
     window.setTimeout(() => setCopyMsg(null), 2200);
-  }, [clearShot]);
+  }, []);
 
   const resume = useCallback(() => {
     engineRef.current?.setPaused(false);
@@ -738,29 +736,49 @@ export default function DanmakuGame() {
                   難易度「{DIFFS[newUnlock.d].name}（偏差値{DIFFS[newUnlock.d].hensachi}）」解禁
                 </div>
               )}
-              {clearShot && (
-                <div className="mt-4 flex w-full max-w-[280px] flex-col items-center gap-2">
-                  <div className="overflow-hidden rounded-sm border border-white/20 shadow-[0_0_24px_rgba(255,100,150,0.25)]">
-                    <img
-                      src={clearShot.url}
-                      alt={clearShot.kind === 'all' ? 'ALL CLEAR' : 'STAGE CLEAR'}
-                      className="block max-h-36 w-auto"
-                      style={{ imageRendering: 'auto' }}
-                    />
+              {(() => {
+                const latest = clearShots[clearShots.length - 1];
+                if (!latest) return null;
+                return (
+                  <div className="mt-4 flex w-full max-w-[280px] flex-col items-center gap-2">
+                    <div className="overflow-hidden rounded-sm border border-white/20 shadow-[0_0_24px_rgba(255,100,150,0.25)]">
+                      <img
+                        src={latest.url}
+                        alt={latest.label}
+                        className="block max-h-36 w-auto"
+                        style={{ imageRendering: 'auto' }}
+                      />
+                    </div>
+                    {clearShots.length > 1 && (
+                      <div className="flex max-w-full flex-wrap items-center justify-center gap-1">
+                        {clearShots.map((s, i) => (
+                          <button
+                            key={`${s.kind}-${i}`}
+                            onClick={() => void copyClearShot(s)}
+                            title={`「${s.label}」をコピー`}
+                            className={`overflow-hidden rounded-sm border transition-opacity ${
+                              i === clearShots.length - 1 ? 'border-pink-300/60' : 'border-white/15 opacity-60 hover:opacity-100'
+                            }`}
+                          >
+                            <img src={s.url} alt={s.label} className="block h-14 w-auto" />
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    <button
+                      onClick={() => void copyClearShot(latest)}
+                      className="flex w-52 items-center justify-center gap-2 rounded-sm border border-pink-300/50 bg-pink-900/30 py-2 text-sm text-pink-100 hover:bg-pink-800/40"
+                    >
+                      <Copy className="h-4 w-4" />
+                      {copyMsg ?? 'クリア画像をコピー'}
+                    </button>
+                    <div className="flex items-center gap-1 text-[10px] text-white/45">
+                      <ImageIcon className="h-3 w-3" />
+                      クリア時に自動でクリップボードへも送っています
+                    </div>
                   </div>
-                  <button
-                    onClick={() => void copyClearShot()}
-                    className="flex w-52 items-center justify-center gap-2 rounded-sm border border-pink-300/50 bg-pink-900/30 py-2 text-sm text-pink-100 hover:bg-pink-800/40"
-                  >
-                    <Copy className="h-4 w-4" />
-                    {copyMsg ?? (clearShot.kind === 'all' ? 'クリア画像をコピー' : 'ステージクリア画像をコピー')}
-                  </button>
-                  <div className="flex items-center gap-1 text-[10px] text-white/45">
-                    <ImageIcon className="h-3 w-3" />
-                    クリア時に自動でクリップボードへも送っています
-                  </div>
-                </div>
-              )}
+                );
+              })()}
               <div className="mt-5 flex flex-col gap-2">
                 <button onClick={retry} className="flex w-52 items-center justify-center gap-2 rounded-sm border border-white/60 py-2 text-sm hover:bg-white/10">
                   <RotateCcw className="h-4 w-4" /> もう一度ステージ1から

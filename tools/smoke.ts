@@ -47,7 +47,7 @@ function makeCanvas(w = 300, h = 150): any {
     addEventListener() {}, removeEventListener() {},
     setPointerCapture() {}, releasePointerCapture() {},
     getBoundingClientRect: () => ({ left: 0, top: 0, width: cv.width, height: cv.height, right: cv.width, bottom: cv.height }),
-    toDataURL: () => '',
+    toDataURL: () => 'data:image/png;base64,FAKEPNG',
   };
   return cv;
 }
@@ -73,21 +73,25 @@ g.AudioContext = undefined;
 
 const { Engine } = await import('../src/game/engine');
 
-interface Outcome { mode: number; diff: number; ended: boolean; cleared: boolean; reached: number; frames: number; error: string; maxBullets: number }
+interface Outcome { mode: number; diff: number; ended: boolean; cleared: boolean; reached: number; frames: number; error: string; maxBullets: number; shots: string[] }
 
 const outcomes: Outcome[] = [];
 
 function simulate(mode: number, diff: number, maxFrames: number): Outcome {
   let result: any = null;
   let lastStage = 0;
+  const shots: string[] = [];
   const eng: any = new Engine(makeCanvas(480, 640), {
     onStageReached: (_m: number, _d: number, s: number) => { lastStage = s; },
     onEnd: (r: any) => { result = r; },
     onPause: () => { /* noop */ },
+    onClearShot: (shot: any) => {
+      shots.push(`${shot?.label ?? '?'}/${typeof shot?.url}/${shot?.url ? shot.url.length : 0}`);
+    },
   });
   eng.resize(480, 640, 1);
   let ts = 0;
-  const out: Outcome = { mode, diff, ended: false, cleared: false, reached: 0, frames: 0, error: '', maxBullets: 0 };
+  const out: Outcome = { mode, diff, ended: false, cleared: false, reached: 0, frames: 0, error: '', maxBullets: 0, shots: [] };
   try {
     eng.startRun(mode, diff, 0);
     for (let f = 0; f < maxFrames; f++) {
@@ -140,9 +144,12 @@ for (const mode of [0, 1]) {
       fail++;
       console.log(`✗ ${tag}: 弾が出現していない (maxBullets=${o.maxBullets})`);
     } else if (o.ended) {
+      const shotOk = o.shots.length >= o.reached;
+      if (!shotOk) fail++;
       console.log(`✓ ${tag}: run終了 (cleared=${o.cleared} reached=${o.reached}, ${(o.frames / 60).toFixed(0)}s, maxBullets=${o.maxBullets})`);
+      console.log(`  ${shotOk ? '✓' : '✗'} クリア画像 ${o.shots.length} 枚（ステージクリア ${o.reached} 回に対し${shotOk ? '十分' : '不足'}）${o.shots.length ? ` 最後:「${o.shots[o.shots.length - 1]}」` : ''}`);
     } else {
-      console.log(`✓ ${tag}: 6分間クラッシュなし（未終了 reached=${o.reached}, maxBullets=${o.maxBullets}）`);
+      console.log(`✓ ${tag}: 6分間クラッシュなし（未終了 reached=${o.reached}, maxBullets=${o.maxBullets}, クリア画像=${o.shots.length}枚）`);
     }
   }
 }
@@ -303,6 +310,64 @@ for (const mode of [0, 1]) {
   for (let f = 0; f < 6; f++) tick();
   console.log(`${eng.bombs === 3 ? '✓' : '✗'} キー設定中（入力ロック）は発動しない`);
   eng.destroy();
+}
+
+// ── クリア画像（シェアカード）の検証 ──────────────────────
+//  phaseT を毎フレーム埋めて全フェーズ即クリア → 最終ステージ → エンディングまで進め、
+//  各ステージクリアでカード（stage）＋ ALL CLEAR カード（all）が出ることを確認する。
+{
+  const HENSACHI = [50, 60, 70, 85];
+  const N_TABLE = [6, 5]; // N_STAGES / N_STAGES_JUMP
+
+  function forceClearAll(mode: number, diff: number): any[] {
+    const shots: any[] = [];
+    let ended = false;
+    const eng: any = new Engine(makeCanvas(480, 640), {
+      onStageReached() { /* noop */ },
+      onEnd() { ended = true; },
+      onPause() { /* noop */ },
+      onClearShot: (shot: any) => shots.push(shot),
+    });
+    eng.resize(480, 640, 1);
+    let ts = 0;
+    const space = (): void => {
+      eng.onKeyDown({ code: 'Space', repeat: false, preventDefault() {} });
+      eng.onKeyUp({ code: 'Space', repeat: false, preventDefault() {} });
+    };
+    eng.startRun(mode, diff, 0);
+    let guard = 0;
+    while (!ended && eng.mode !== 'over' && guard < 60 * 60 * 12) {
+      guard++;
+      ts += 1000 / 60;
+      if (eng.mode === 'phase') eng.phaseT = eng.phaseDur; // フェーズを即クリア
+      if (mode === 1) space(); // 無限ジャンプはジャンプし続けないと時間が止まる
+      rafCb?.(ts);
+    }
+    eng.destroy();
+    return shots;
+  }
+
+  console.log('\n── クリア画像（シェアカード） ──────────────────────');
+  for (const [mode, diff] of [[0, 0], [1, 1]] as const) {
+    const shots = forceClearAll(mode, diff);
+    const nStage = N_TABLE[mode];
+    const head = mode === 1 ? `偏差値${HENSACHI[diff]}の無限ジャンプクリア` : `偏差値${HENSACHI[diff]}クリア`;
+    const okCount = shots.length === nStage + 1;
+    const okHeads = shots.every((s) => s?.headline === head);
+    const okUrl = shots.every((s) => typeof s?.url === 'string' && s.url.startsWith('data:image/png'));
+    const okKinds = shots.filter((s) => s?.kind === 'stage').length === nStage && shots[shots.length - 1]?.kind === 'all';
+    const okLabels = shots.every((s) => typeof s?.label === 'string' && s.label.includes(head));
+    const pass = okCount && okHeads && okUrl && okKinds && okLabels;
+    if (!pass) fail++;
+    const last = shots[shots.length - 1];
+    console.log(
+      `${pass ? '✓' : '✗'} mode${mode} d${diff}: ${shots.length}枚（期待 ${nStage + 1}） `
+      + `headline=「${shots[0]?.headline ?? 'なし'}」 label例=「${shots[0]?.label ?? 'なし'}」 最後=「${last?.label ?? 'なし'}」`,
+    );
+    if (!pass) {
+      console.log(`   count=${okCount} heads=${okHeads} url=${okUrl} kinds=${okKinds} labels=${okLabels}`);
+    }
+  }
 }
 
 console.log(fail === 0 ? '\nSMOKE: OK' : `\nSMOKE: ${fail} failure(s)`);

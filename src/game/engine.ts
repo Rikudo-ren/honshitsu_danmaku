@@ -13,7 +13,7 @@ import {
   FL_GRAZED, FL_STOP, FL_FADE, FL_SUPER, FL_NOCULL,
   F_DISPLAY, F_UI, F_MINCHO,
   DIFFS, STAGE_TABLES, N_STAGES, N_STAGES_JUMP, POP_TEXTS, POP_MAA, POP_EXTEND, COUNTDOWN, PATTERN_CAL,
-  ENDING_LINES_ALL, stageLabel,
+  ENDING_LINES_ALL, stageLabel, MODES,
   levelOf, spdMul, denMul, rateMul, gapMul, trackMul,
   type ModeId, type StageDef,
   defaultKeys, WASD_ALIAS, type KeyMap, type KeyAction,
@@ -74,12 +74,23 @@ export interface RunResult {
   noMissPhases: number;
 }
 
+/** クリア画像（シェアカード）。ステージクリア／ALL CLEAR の度に 1 枚生成される */
+export interface ClearShot {
+  /** PNG data URL */
+  url: string;
+  kind: 'stage' | 'all';
+  /** 画像の見出し（例: 偏差値50クリア / 偏差値60の無限ジャンプクリア） */
+  headline: string;
+  /** トースト等の短いラベル（例: STAGE 2 · 偏差値50クリア） */
+  label: string;
+}
+
 export interface EngineEvents {
   onStageReached: (m: ModeId, d: number, s: number) => void;
   onEnd: (r: RunResult) => void;
   onPause: (paused: boolean) => void;
-  /** ステージクリア／エンディング到達時にクリア画像（data URL）を渡す */
-  onClearShot?: (dataUrl: string, kind: 'stage' | 'all') => void;
+  /** ステージクリア／エンディング到達時にクリア画像を渡す */
+  onClearShot?: (shot: ClearShot) => void;
 }
 
 // ── 事前生成文字列（HUD で毎フレーム連結しない） ───────────
@@ -102,6 +113,13 @@ const FONT_BOMBCHIP = `700 9px ${F_UI}`;
 const DIFF_HUD: readonly string[] = DIFFS.map((d) => `${d.name} · 偏差値`);
 const BOSS_HUD: readonly (readonly string[])[] = STAGE_TABLES.map((t) => t.map((s) => s.boss));
 const MODE_HUD: readonly string[] = ['回避弾幕', '無限ジャンプ'];
+
+// ── クリア画像（シェアカード 720×960） ───────────────────
+const CARD_W = 720;
+const CARD_H = 960;
+const FONT_CARD_CHIP = `700 24px ${F_UI}`;
+const FONT_CARD_SCORE = `700 18px ${F_UI}`;
+const FONT_CARD_WM = `700 14px ${F_UI}`;
 
 function ease(t: number): number {
   return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
@@ -1029,14 +1047,13 @@ export class Engine {
       if (steps === 6) this.acc = 0;
     }
     this.render(this.paused ? 1 : this.acc / STEP);
-    // クリア画像：指定フレームで canvas をキャプチャして UI へ渡す
+    // クリア画像：指定フレームでクリアカードを生成して UI へ渡す
     if (this.clearShotAt >= 0 && this.globalT >= this.clearShotAt && !this.paused) {
       this.clearShotAt = -1;
       try {
-        const url = this.canvas.toDataURL('image/png');
-        this.events.onClearShot?.(url, this.clearShotKind);
+        this.events.onClearShot?.(this.composeClearShot(this.clearShotKind));
       } catch {
-        /* toDataURL が使えない環境ではスキップ */
+        /* カードを生成できない環境ではスキップ */
       }
     }
     this.audio.tick();
@@ -2477,6 +2494,125 @@ export class Engine {
     const fw = this.gold.cw * sc;
     this.ctx.drawImage(this.gold.canvas, DIGIT_PLUS * this.gold.cw, 0, this.gold.cw, this.gold.ch, x - 70 - fw / 2, y, fw, h);
     this.drawNum(this.gold, v, x + 6, y, h, 2, 0);
+  }
+
+  /** テキストが maxW に収まるようフォントサイズを縮小する（クリアカード専用・発生はクリア 1 回のみ） */
+  private cardFitFont(g: CanvasRenderingContext2D, text: string, maxW: number, size: number, family: string): number {
+    g.font = `${size}px ${family}`;
+    const w = g.measureText(text).width;
+    if (w > maxW) {
+      size = Math.max(16, Math.floor((size * maxW) / w));
+      g.font = `${size}px ${family}`;
+    }
+    return size;
+  }
+
+  /**
+   * クリア画像（シェアカード）を生成する。
+   * クリア瞬間のゲーム画面を背景に、モード・偏差値・何をクリアしたかを焼き込む。
+   * 呼ばれるのはステージクリア／ALL CLEAR の瞬間の 1 フレームのみ（アロケーション許容）。
+   */
+  private composeClearShot(kind: 'stage' | 'all'): ClearShot {
+    const m = this.gameType;
+    const diff = DIFFS[this.diff];
+    const st = this.stages()[this.stage];
+    const mode = MODES[m];
+    const accent = kind === 'stage' ? st.color : mode.color;
+    // 見出し：偏差値50クリア ／ 偏差値60の無限ジャンプクリア
+    const headline = m === 1 ? `偏差値${diff.hensachi}の無限ジャンプクリア` : `偏差値${diff.hensachi}クリア`;
+    const label = kind === 'all' ? `ALL CLEAR · ${headline}` : `${stageLabel(this.nStages(), this.stage)} · ${headline}`;
+
+    const card = mkCanvas(CARD_W, CARD_H);
+    const g = card.getContext('2d')!;
+
+    // 背景：クリア瞬間のゲーム画面（はみ出た分は中央トリミング）
+    const sw = this.canvas.width;
+    const sh = this.canvas.height;
+    const sc = Math.max(CARD_W / sw, CARD_H / sh);
+    g.imageSmoothingEnabled = true;
+    g.drawImage(this.canvas, (CARD_W - sw * sc) / 2, (CARD_H - sh * sc) / 2, sw * sc, sh * sc);
+
+    // 読みやすさ用の暗幕（上・下）
+    let gr = g.createLinearGradient(0, 0, 0, 150);
+    gr.addColorStop(0, 'rgba(4,5,11,0.78)');
+    gr.addColorStop(1, 'rgba(4,5,11,0)');
+    g.fillStyle = gr;
+    g.fillRect(0, 0, CARD_W, 150);
+    gr = g.createLinearGradient(0, 440, 0, CARD_H);
+    gr.addColorStop(0, 'rgba(4,5,11,0)');
+    gr.addColorStop(0.45, 'rgba(4,5,11,0.72)');
+    gr.addColorStop(1, 'rgba(4,5,11,0.95)');
+    g.fillStyle = gr;
+    g.fillRect(0, 440, CARD_W, CARD_H - 440);
+
+    g.textBaseline = 'middle';
+
+    // 枠（クリア色）
+    g.globalAlpha = 0.5;
+    g.strokeStyle = accent;
+    g.lineWidth = 2;
+    g.strokeRect(12.5, 12.5, CARD_W - 25, CARD_H - 25);
+    g.globalAlpha = 1;
+
+    // 上端：左=モード、右=偏差値・科名＋SCORE
+    g.textAlign = 'left';
+    g.fillStyle = mode.color;
+    g.fillRect(44, 46, 6, 24);
+    g.font = FONT_CARD_CHIP;
+    g.fillText(mode.name, 62, 58);
+    g.textAlign = 'right';
+    g.fillStyle = 'rgba(255,255,255,0.92)';
+    g.fillText(`偏差値${diff.hensachi}　${diff.name}`, CARD_W - 44, 58);
+    g.font = FONT_CARD_SCORE;
+    g.fillStyle = '#ffd98a';
+    g.fillText(`SCORE ${this.score.toLocaleString()}`, CARD_W - 44, 94);
+
+    // 下部パネル：何をクリアしたか
+    g.textAlign = 'center';
+    // アクセントの短線
+    g.globalAlpha = 0.85;
+    g.shadowColor = accent;
+    g.shadowBlur = 12;
+    g.fillStyle = accent;
+    g.fillRect(CARD_W / 2 - 36, 700, 72, 4);
+    g.shadowBlur = 0;
+    g.globalAlpha = 1;
+    // コンテキスト行（ステージ名 or 全制圧）
+    const ctxText = kind === 'all'
+      ? `全${this.nStages()}ステージ制圧　——　ALL CLEAR`
+      : `STAGE ${this.stage + 1}「${st.boss}」制圧　——　${st.title}`;
+    this.cardFitFont(g, ctxText, 620, 26, F_MINCHO);
+    g.fillStyle = '#f5e9d0';
+    g.fillText(ctxText, CARD_W / 2, 748);
+    // 見出しの修飾部（偏差値60の無限ジャンプ など）
+    const qual = m === 1 ? `偏差値${diff.hensachi}の無限ジャンプ` : `偏差値${diff.hensachi}`;
+    this.cardFitFont(g, qual, 640, 46, F_DISPLAY);
+    g.shadowColor = accent;
+    g.shadowBlur = 18;
+    g.fillStyle = '#ffffff';
+    g.fillText(qual, CARD_W / 2, 806);
+    g.shadowBlur = 0;
+    // 「クリア」は字間を広げて一文字ずつ
+    g.font = `100px ${F_DISPLAY}`;
+    const qw = g.measureText('ク').width;
+    const gap = 30;
+    const total = qw * 3 + gap * 2;
+    let x = (CARD_W - total) / 2 + qw / 2;
+    g.shadowColor = accent;
+    g.shadowBlur = 26;
+    g.fillStyle = '#ffffff';
+    for (let i = 0; i < 3; i++) {
+      g.fillText('クリア'[i], x + i * (qw + gap), 888);
+    }
+    g.shadowBlur = 0;
+
+    // 左下ウォーターマーク
+    g.textAlign = 'left';
+    g.font = FONT_CARD_WM;
+    g.fillStyle = 'rgba(255,255,255,0.5)';
+    g.fillText('✝本質✝回避弾幕', 44, 938);
+
+    return { url: card.toDataURL('image/png'), kind, headline, label };
   }
 
   private drawStageClear(): void {
