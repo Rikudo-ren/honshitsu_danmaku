@@ -7,14 +7,14 @@
 // ─────────────────────────────────────────────────────────────
 import {
   W, H, TAU, TYPE_HIT, TYPE_VIS, TYPE_ROT, COLORS, N_COLORS,
-  T_SMALL, T_MED, T_LARGE, T_CROSS, T_PETAL,
+  T_SMALL, T_MED, T_LARGE, T_CROSS,
   C_RED, C_YELLOW, C_VIOLET, C_PINK, C_WHITE,
   B_LINEAR, B_REDIRECT, B_BOUNCE, B_POLAR, B_GRAVITY, B_SINE, B_STEP, B_SPLIT, B_HOMING,
   FL_GRAZED, FL_STOP, FL_FADE, FL_SUPER, FL_NOCULL,
   F_DISPLAY, F_UI, F_MINCHO,
   DIFFS, STAGE_TABLES, N_STAGES, N_STAGES_JUMP, POP_TEXTS, POP_MAA, POP_EXTEND, COUNTDOWN, PATTERN_CAL,
   ENDING_LINES_ALL, stageLabel,
-  levelOf, spdMul, denMul, rateMul,
+  levelOf, spdMul, denMul, rateMul, gapMul, trackMul,
   type ModeId, type StageDef,
   defaultKeys, WASD_ALIAS, type KeyMap, type KeyAction,
 } from './data';
@@ -57,7 +57,6 @@ const K_SPARK = 0;
 const K_DOT = 1;
 const K_RING = 2;
 const K_ITEM = 3;
-const K_PETAL = 4;
 
 export type Mode = 'attract' | 'intro' | 'phase' | 'gap' | 'stageclear' | 'over' | 'ending';
 
@@ -79,6 +78,8 @@ export interface EngineEvents {
   onStageReached: (m: ModeId, d: number, s: number) => void;
   onEnd: (r: RunResult) => void;
   onPause: (paused: boolean) => void;
+  /** ステージクリア／エンディング到達時にクリア画像（data URL）を渡す */
+  onClearShot?: (dataUrl: string, kind: 'stage' | 'all') => void;
 }
 
 // ── 事前生成文字列（HUD で毎フレーム連結しない） ───────────
@@ -381,6 +382,10 @@ export class Engine {
   sp = 1;
   dn = 1;
   R = 1;
+  /** 隙間縮小係数 gapMul(L) — 壁・帯・環の切れ目幅に掛ける */
+  gp = 1;
+  /** 追尾・収束倍率 trackMul(L) — ホーミング角速度・扇の狭さ */
+  tr = 1;
   /** パターン別較正係数（beginPhase で PATTERN_CAL から設定される） */
   cal = 1;
   score = 0;
@@ -427,7 +432,7 @@ export class Engine {
   emitLink = false;
   readonly emitX = new Float32Array(4);
   readonly emitY = new Float32Array(4);
-  petals = false;
+
   private timeStop = 0;
 
   // ── FX ─────────────────────────────────────────────────
@@ -450,6 +455,9 @@ export class Engine {
   private bannerClean = false;
   private stageBonus = 0;
   private phaseNameW = 100;
+  /** クリア画像を撮るフレーム（globalT）。-1 = なし */
+  private clearShotAt = -1;
+  private clearShotKind: 'stage' | 'all' = 'stage';
 
   constructor(canvas: HTMLCanvasElement, events: EngineEvents) {
     this.canvas = canvas;
@@ -538,6 +546,8 @@ export class Engine {
     this.sp = 1;
     this.dn = 1;
     this.R = 1;
+    this.gp = 1;
+    this.tr = 1;
     this.audio.setMuffle(false);
     this.audio.bgmStart(6, 0);
   }
@@ -651,6 +661,19 @@ export class Engine {
     return this.tick(k, base / Math.max(0.2, this.dn * this.cal));
   }
 
+  /**
+   * 逃げ道の幅（論理px）。base に gapMul(L) を掛け、自機直径＋余白を下回らない。
+   * 壁・帯・環の切れ目は必ずこれで決める（L を直接読む閾値は禁止）。
+   */
+  gap(base: number, floor = 28): number {
+    return Math.max(floor, base * this.gp);
+  }
+
+  /** 追尾角速度・扇の狭さ倍率（trackMul） */
+  track(base = 1): number {
+    return base * this.tr;
+  }
+
   spawn(x: number, y: number, a: number, s: number, type: number, col: number): number {
     if (this.bn >= MAXB) return -1;
     const i = this.bn++;
@@ -758,7 +781,6 @@ export class Engine {
     this.timeStop = 0;
     this.wellOn = false;
     this.emitN = 0;
-    this.petals = false;
     this.stepF = 1;
     this.cutinT = -1;
     this.bombT = 0;
@@ -766,6 +788,7 @@ export class Engine {
     this.flash = 0;
     this.hitStop = 0;
     this.danger = 0;
+    this.clearShotAt = -1;
   }
 
   // ═══ Flow ════════════════════════════════════════════════
@@ -780,7 +803,6 @@ export class Engine {
     this.bossY = this.bossPY = -80;
     this.wander = false;
     this.moveBoss(W / 2, 120, 110);
-    this.petals = false;
     this.audio.bgmStart(s, 0);
     this.audio.setIntensity(0);
     this.events.onStageReached(this.gameType, this.diff, s);
@@ -803,7 +825,6 @@ export class Engine {
     this.emitN = 0;
     this.emitLink = false;
     this.stepF = 1;
-    this.petals = false;
     this.timeStop = 0;
     this.phaseMissed = false;
     this.phaseBombed = false;
@@ -824,6 +845,8 @@ export class Engine {
     this.sp = spdMul(this.L);
     this.dn = denMul(this.L);
     this.R = rateMul(this.L);
+    this.gp = gapMul(this.L);
+    this.tr = trackMul(this.L);
   }
 
   private clearPhase(): void {
@@ -871,6 +894,9 @@ export class Engine {
     this.audio.setIntensity(0);
     this.moveBoss(W / 2, -160, 150);
     this.events.onStageReached(this.gameType, this.diff, this.stage + 1);
+    // バナーが見えるタイミングでクリア画像を撮る
+    this.clearShotAt = this.globalT + 36;
+    this.clearShotKind = 'stage';
   }
 
   private emitEnd(cleared: boolean): void {
@@ -1003,6 +1029,16 @@ export class Engine {
       if (steps === 6) this.acc = 0;
     }
     this.render(this.paused ? 1 : this.acc / STEP);
+    // クリア画像：指定フレームで canvas をキャプチャして UI へ渡す
+    if (this.clearShotAt >= 0 && this.globalT >= this.clearShotAt && !this.paused) {
+      this.clearShotAt = -1;
+      try {
+        const url = this.canvas.toDataURL('image/png');
+        this.events.onClearShot?.(url, this.clearShotKind);
+      } catch {
+        /* toDataURL が使えない環境ではスキップ */
+      }
+    }
     this.audio.tick();
   };
 
@@ -1062,9 +1098,11 @@ export class Engine {
           else {
             this.mode = 'ending';
             this.modeT = 0;
-            this.petals = true;
             this.bossVisible = false;
             this.audio.bgmStart(6, 0);
+            // エンディングの「✝完✝」が見える頃に ALL CLEAR 画像
+            this.clearShotAt = this.globalT + 400;
+            this.clearShotKind = 'all';
           }
         }
         break;
@@ -1094,9 +1132,6 @@ export class Engine {
     this.updateCancel();
     this.updateParticles();
     this.updatePopups();
-    if (this.petals && (this.globalT & 3) === 0) {
-      this.addP(K_PETAL, Math.random() * W, -10, (Math.random() - 0.3) * 0.8, 0.6 + Math.random() * 0.9, 900, 1 + Math.random() * 1.2, C_PINK);
-    }
     this.danger *= 0.85;
   }
 
@@ -1452,7 +1487,6 @@ export class Engine {
     const r2 = this.cancelR * this.cancelR;
     const cx = this.cancelX;
     const cy = this.cancelY;
-    const petal = this.stage === this.nStages() - 1 && this.mode !== 'attract';
     let i = 0;
     while (i < this.bn) {
       const dx = this.bx[i] - cx;
@@ -1464,8 +1498,6 @@ export class Engine {
           const a = Math.random() * TAU;
           const s = 0.5 + Math.random() * 2;
           this.addP(K_ITEM, x, y, Math.cos(a) * s, Math.sin(a) * s, 999, 1, this.bcol[i]);
-        } else if (petal) {
-          this.addP(K_PETAL, x, y, (Math.random() - 0.5) * 1.5, -0.5 - Math.random(), 160, 1.2, C_PINK);
         } else {
           this.addP(K_DOT, x, y, 0, 0, 16, 7, this.bcol[i]);
         }
@@ -1521,14 +1553,6 @@ export class Engine {
           if (sp > d) sp = d;
           this.ppx[i] += (dx / d) * sp;
           this.ppy[i] += (dy / d) * sp;
-        }
-      } else if (k === K_PETAL) {
-        this.ppx[i] += this.pvx[i] + Math.sin(this.globalT * 0.03 + i) * 0.35;
-        this.ppy[i] += this.pvy[i];
-        this.prot[i] += 0.03 * this.psz[i];
-        if (this.ppy[i] > H + 20) {
-          this.killP(i);
-          continue;
         }
       } else if (k === K_RING) {
         this.psz[i] += this.pvx[i];
@@ -1906,10 +1930,9 @@ export class Engine {
     }
   }
 
-  private drawParticles(shx: number, shy: number): void {
+  private drawParticles(_shx: number, _shy: number): void {
     if (this.pn === 0) return;
     const c = this.ctx;
-    const S = this.S;
     const glow = this.sprites.glow;
     const core = this.sprites.core;
     c.globalCompositeOperation = 'lighter';
@@ -1950,19 +1973,6 @@ export class Engine {
           c.globalAlpha = 1;
           c.drawImage(core[T_CROSS * N_COLORS + C_WHITE], x - 4, y - 4, 8, 8);
           break;
-        case K_PETAL: {
-          const a = this.prot[i];
-          const sc = S * 0.9 * this.psz[i];
-          const cs = Math.cos(a) * sc;
-          const sn = Math.sin(a) * sc;
-          c.globalCompositeOperation = 'source-over';
-          c.globalAlpha = Math.min(1, lf * 3) * 0.75;
-          c.setTransform(cs, sn * 0.5, -sn, cs, (x + shx) * S, (y + shy) * S);
-          c.drawImage(core[T_PETAL * N_COLORS + C_PINK], -5, -5, 10, 10);
-          c.setTransform(S, 0, 0, S, shx * S, shy * S);
-          c.globalCompositeOperation = 'lighter';
-          break;
-        }
       }
     }
     c.globalCompositeOperation = 'source-over';

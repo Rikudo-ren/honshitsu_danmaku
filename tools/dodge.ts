@@ -1,28 +1,9 @@
 // ─────────────────────────────────────────────────────────────
-//  難度係数キャリブレーション計測器
-//
-//  「表示している難度係数 L」と「実際に画面に出ている弾幕の強さ T」が
-//  一致しているかを、ヘッドレスで実測する検証ツール。
-//
-//  弾幕強度の定義（このゲームの唯一の難易度指標）:
-//    T = Σ_(画面上の弾) w種[w] · w挙動 · (速度/BASE_SPD)^2
-//    → 弾が毎秒どれだけ画面を横切り、どれだけ反応時間を奪うかの総量。
-//      弾数・頻度・速度のすべてに単調で、data.ts の強度モデル
-//         S(L) = spdMul(L)·denMul(L)·rateMul(L)
-//      と比例する（弾は画面外で消えるため生存時間 ∝ 1/速度、よって Σ生存数·速度² ∝ 発射量·速度）。
-//
-//  目標: T ≈ K · S(Lmid)
-//    ・全フェーズで T / (K·S) ≒ 1.00（±0.15 以内）
-//    ・係数の単調性 = 実測の単調性（難易度・ステージ・フェーズの順序）
-//    ・ずれは PATTERN_CAL[id] を 1/(T/(K·S)) 倍して補正する
-//
-//  使い方:
-//    npx esbuild tools/measure.ts --bundle --platform=node --format=esm \
-//      --outfile=/tmp/measure.mjs --log-level=warning && node /tmp/measure.mjs
-//    node /tmp/measure.mjs --cal   # 較正テーブルの提案を出力
+//  回避難度シミュレータ — 「画面下部の自機がどれだけ避けにくいか」
+//  弾の総量 T ではなく、自機近傍の危険度・隙間・反応時間を測る。
 // ─────────────────────────────────────────────────────────────
 import {
-  STAGE_TABLES, levelOf, spdMul, denMul, rateMul, gapMul, trackMul, intensityOf, TYPE_HIT, PATTERN_CAL,
+  STAGE_TABLES, levelOf, spdMul, denMul, rateMul, gapMul, trackMul, TYPE_HIT, PATTERN_CAL,
   W, H, TAU, BASE_SPD,
 } from '../src/game/data';
 import { PATTERNS } from '../src/game/patterns';
@@ -30,11 +11,10 @@ import { PATTERNS_JUMP } from '../src/game/patternsJump';
 
 const MAXB = 4096;
 const WARM = 70;
-const K = 110;              // 目標係数（T = K·S(Lmid)）
-const LASER_K = 300;        // レーザーの画面占有力の換算
-
-const BEH_W = [1.0, 1.15, 1.15, 1.15, 1.1, 1.05, 1.02, 1.25, 1.35];
-const TYPE_W = [1.0, 1.63, 3.46, 0.95, 0.95, 1.19, 1.19, 1.19, 1.0];
+const PR = 2.4;
+const FAST = 4.3;
+const SLOW = 1.8;
+const PL_Y0 = H - 70; // 回避弾幕の定位置
 
 class Mock {
   bn = 0;
@@ -53,11 +33,13 @@ class Mock {
   sp = 1; dn = 1; R = 1; gp = 1; tr = 1; L = 0; cal = 1;
   wander = true; stepF = 1; wellOn = false; wellX = W / 2; wellY = 320; wellG = 260;
   emitN = 0; emitLink = false; emitX = new Float32Array(4); emitY = new Float32Array(4);
-  plX = W / 2; plY = H - 70;
+  plX = W / 2; plY = PL_Y0;
   gameType = 0;
   private seed = 1;
   private ts = 0;
   private msx = 0; private msy = 0; private mtx = 0; private mty = 0; private moveT = 0; private moveDur = 1;
+  lasers: { t: number; len: number; w: number; warn: number; act: number; x: number; y: number; a: number }[] = [];
+  private frozen = 0;
 
   reset(seed: number): void {
     this.bn = 0; this.seed = seed >>> 0 || 1; this.ts = 0;
@@ -65,6 +47,8 @@ class Mock {
     this.wander = true; this.stepF = 1; this.wellOn = false; this.emitN = 0;
     this.bossX = W / 2; this.bossY = -80; this.msx = this.bossX; this.msy = this.bossY;
     this.mtx = this.bossX; this.mty = this.bossY; this.moveT = 0; this.moveDur = 1;
+    this.lasers = []; this.frozen = 0;
+    this.plX = W / 2; this.plY = PL_Y0;
   }
   rnd(): number {
     let s = this.seed; s ^= s << 13; s >>>= 0; s ^= s >>> 17; s ^= s << 5; s >>>= 0;
@@ -91,18 +75,16 @@ class Mock {
     this.bbeh[i] = 0; this.btyp[i] = type; this.bcol[i] = col; this.bflg[i] = 0;
     return i;
   }
-  shot(): void { /* noop */ }
+  shot(): void {}
   moveBoss(x: number, y: number, dur: number): void {
     this.msx = this.bossX; this.msy = this.bossY; this.mtx = x; this.mty = y; this.moveT = 0; this.moveDur = Math.max(1, dur);
   }
-  laser(_x: number, _y: number, _a: number, len: number, w: number, warn: number, act: number): void {
-    this.lasers.push({ t: 0, len, w, warn, act });
+  laser(x: number, y: number, a: number, len: number, w: number, warn: number, act: number): void {
+    this.lasers.push({ t: 0, len, w, warn, act, x, y, a });
   }
-  lasers: { t: number; len: number; w: number; warn: number; act: number }[] = [];
-  private frozen = 0;
   startTimeStop(dur = 200): void { this.frozen = Math.max(this.frozen, dur); }
-  popText(): void { /* noop */ }
-  flashScreen(): void { /* noop */ }
+  popText(): void {}
+  flashScreen(): void {}
 
   killB(i: number): void {
     const l = --this.bn;
@@ -114,16 +96,16 @@ class Mock {
     this.bbeh[i] = this.bbeh[l]; this.btyp[i] = this.btyp[l]; this.bcol[i] = this.bcol[l]; this.bflg[i] = this.bflg[l];
   }
 
-  stepBullets(): number {
-    let threat = 0;
+  /** 1フレーム進め、プレイヤー帯の危険指標を返す */
+  step(): { near: number; dens: number; minGap: number; aimed: number; hitProb: number } {
+    if (this.frozen > 0) this.frozen--;
     const frozen = this.frozen > 0;
-    if (frozen) this.frozen--;
     let i = 0;
     while (i < this.bn) {
       let x = this.bx[i]; let y = this.by[i];
       const beh = this.bbeh[i];
-      let vx = 0; let vy = 0; let dead = false;
-      if (frozen && (this.bflg[i] & 2)) { i++; continue; }  // FL_STOP：時止め中は完全停止（脅威ゼロ）
+      let dead = false;
+      if (frozen && (this.bflg[i] & 2)) { i++; continue; }
       const t = ++this.bt[i];
       let a = this.ba[i];
       let s = this.bs[i] + this.bacc[i];
@@ -131,10 +113,10 @@ class Mock {
       else if (s > this.bmax[i]) s = this.bmax[i];
       this.bs[i] = s;
       a += this.bav[i];
+      let vx = 0, vy = 0;
       switch (beh) {
         case 0: case 1:
-          vx = Math.cos(a) * s; vy = Math.sin(a) * s;
-          break;
+          vx = Math.cos(a) * s; vy = Math.sin(a) * s; break;
         case 2: {
           const c = Math.cos(a); const sn = Math.sin(a);
           vx = c * s; vy = sn * s;
@@ -220,21 +202,59 @@ class Mock {
           if (x < -m || x > W + m || y < -m || y > H + m) dead = true;
         }
       }
-      const spd = Math.sqrt(vx * vx + vy * vy);
-      if (!dead) threat += TYPE_W[this.btyp[i]] * BEH_W[beh] * (spd / BASE_SPD) ** 2;
       if (dead) { this.killB(i); continue; }
       i++;
     }
     this.ts++;
-    this.plX = W / 2 + Math.sin(this.ts * 0.011) * 150;
-    this.plY = 400 + Math.sin(this.ts * 0.017) * 120;
-    // レーザー（稼働中の画面占有力）
-    let lz = 0;
+    // 自機は「定位置帯」を左右に動く（フォーカス寄り：実プレイの標準）
+    this.plX = W / 2 + Math.sin(this.ts * 0.021) * 110;
+    this.plY = PL_Y0 + Math.sin(this.ts * 0.013) * 40;
+
+    // ── プレイヤー帯 (y = PL_Y0 ± 80) の危険度 ──
+    const ZONE_LO = PL_Y0 - 100;
+    const ZONE_HI = PL_Y0 + 60;
+    // x 方向 16 セルの占有
+    const CELLS = 24;
+    const occ = new Float32Array(CELLS);
+    let near = 0; // 自機 80px 以内の弾の脅威（速度/距離）
+    let dens = 0;
+    let aimed = 0;
+    for (let j = 0; j < this.bn; j++) {
+      const x = this.bx[j], y = this.by[j];
+      if (y < ZONE_LO || y > ZONE_HI) continue;
+      dens++;
+      const r = this.br[j] + PR + 6;
+      const c0 = Math.max(0, Math.floor(((x - r) / W) * CELLS));
+      const c1 = Math.min(CELLS - 1, Math.floor(((x + r) / W) * CELLS));
+      for (let c = c0; c <= c1; c++) occ[c] = Math.max(occ[c], 1);
+      const dx = x - this.plX, dy = y - this.plY;
+      const d = Math.sqrt(dx * dx + dy * dy) + 0.5;
+      if (d < 90) {
+        const spd = Math.abs(this.bs[j]);
+        near += (spd / BASE_SPD) * (1 - d / 90) * (TYPE_HIT[this.btyp[j]] / 2.6);
+      }
+      // 自機狙い寄りの弾：進行方向が自機に向いている
+      const ax = Math.cos(this.ba[j]), ay = Math.sin(this.ba[j]);
+      const toPx = this.plX - x, toPy = this.plY - y;
+      const td = Math.sqrt(toPx * toPx + toPy * toPy) + 0.1;
+      const dot = (ax * toPx + ay * toPy) / td;
+      if (dot > 0.92 && y < this.plY) aimed += 1;
+    }
+    // 最大連続空きセル → 隙間幅
+    let maxRun = 0, run = 0;
+    for (let c = 0; c < CELLS; c++) {
+      if (occ[c] < 0.5) { run++; if (run > maxRun) maxRun = run; }
+      else run = 0;
+    }
+    const minGap = (maxRun / CELLS) * W;
+    // 自機位置セルが塞がれている確率的指標
+    const pc = Math.min(CELLS - 1, Math.max(0, Math.floor((this.plX / W) * CELLS)));
+    const hitProb = occ[pc];
+
     for (const l of this.lasers) {
       l.t++;
-      if (l.t > l.warn && l.t <= l.warn + l.act) lz += (l.len * (l.w + 12)) / (W * H) * LASER_K;
     }
-    return threat + lz;
+    return { near, dens, minGap, aimed, hitProb };
   }
 
   updateBoss(): void {
@@ -251,135 +271,87 @@ class Mock {
 }
 
 interface Row {
-  mode: number; d: number; s: number; p: number;
-  id: string; Lmid: number; target: number;
-  live: number; alive: number; peak: number; speed: number; fire: number; ratio: number;
+  mode: number; d: number; s: number; p: number; id: string; L: number;
+  near: number; dens: number; gap: number; aimed: number; occ: number; dodge: number;
 }
 
-function measurePhase(mode: number, d: number, s: number, p: number, table: readonly any[]): Row | null {
+function measure(mode: number, d: number, s: number, p: number): Row | null {
+  const table = STAGE_TABLES[mode];
   const stage = table[s];
   const ph = stage.phases[p];
   const pat = (mode === 0 ? PATTERNS : PATTERNS_JUMP)[ph.id];
   if (!pat) return null;
   const g = new Mock();
   g.gameType = mode;
-  const durFrames = Math.round(ph.dur * 60);
-  const L0 = levelOf(d, s, p, 0);
-  const NSEED = 4;
-  let liveSum = 0, aliveAvg = 0, speedAvg = 0, peak = 0;
+  const dur = Math.round(ph.dur * 60);
+  const NSEED = 3;
+  let nearS = 0, densS = 0, gapS = 0, aimS = 0, occS = 0, n = 0;
   for (let sd = 0; sd < NSEED; sd++) {
-    g.reset(0x51ed + mode * 977 + d * 131 + s * 17 + p + sd * 7919);
+    g.reset(0xA11CE + mode * 977 + d * 131 + s * 17 + p + sd * 7919);
     g.cal = PATTERN_CAL[ph.id] ?? 1;
-    g.bossX = W / 2; g.bossY = -80; g.msx = W / 2; g.msy = -80;
-    g.tmr.fill(0.999); g.cnt.fill(0); g.fv.fill(0);
+    g.bossX = W / 2; g.bossY = -80;
+    g.tmr.fill(0.999);
+    const L0 = levelOf(d, s, p, 0);
     g.sp = spdMul(L0); g.dn = denMul(L0); g.R = rateMul(L0); g.gp = gapMul(L0); g.tr = trackMul(L0); g.L = L0;
     if (pat.init) pat.init(g as never, g.L);
     g.moveBoss(W / 2, 120, 110);
-    let sum = 0; let n = 0; let aliveSum = 0; let peak0 = 0; let speedSum = 0; let speedN = 0;
-    for (let t = 0; t < durFrames; t++) {
+    for (let t = 0; t < dur; t++) {
       g.phaseT = t;
-      const f = Math.min(1, t / durFrames);
+      const f = Math.min(1, t / dur);
       const L = levelOf(d, s, p, f);
       g.L = L; g.sp = spdMul(L); g.dn = denMul(L); g.R = rateMul(L); g.gp = gapMul(L); g.tr = trackMul(L);
       g.updateBoss();
       if (t >= WARM) pat.update(g as never, t - WARM, L);
-      const thr = g.stepBullets();
-      const spawned = g.bn;
-      if (t >= 30) {
-        sum += thr; n++; aliveSum += spawned;
-        if (spawned > peak0) peak0 = spawned;
-        for (let i = 0; i < g.bn; i++) { speedSum += g.bs[i]; speedN++; }
+      const m = g.step();
+      if (t >= 90) {
+        nearS += m.near; densS += m.dens; gapS += m.minGap; aimS += m.aimed; occS += m.hitProb; n++;
       }
     }
-    liveSum += n > 0 ? sum / n : 0;
-    aliveAvg += n > 0 ? aliveSum / n : 0;
-    speedAvg += speedN > 0 ? speedSum / speedN : 0;
-    if (peak0 > peak) peak = peak0;
   }
-  const live = liveSum / NSEED;
-  const Lmid = levelOf(d, s, p, 0.5);
-  const target = K * intensityOf(Lmid);
-  return {
-    mode, d, s, p, id: ph.id, Lmid, target,
-    live, alive: aliveAvg / NSEED, peak,
-    speed: speedAvg / NSEED,
-    fire: 0, ratio: target > 0 ? live / target : 0,
-  };
+  const near = nearS / n, dens = densS / n, gap = gapS / n, aimed = aimS / n, occ = occS / n;
+  // 回避難度 D: 近傍脅威↑ 密度↑ 隙間↓ 狙い弾↑ 占有↑
+  // gap は 40px 未満で急激に危険、120px 以上で余裕
+  const gapPenalty = gap < 40 ? 3.0 : gap < 80 ? 1.5 + (80 - gap) / 40 : gap < 140 ? (140 - gap) / 60 : 0.2;
+  const dodge = near * 1.4 + dens * 0.08 + aimed * 0.35 + occ * 2.5 + gapPenalty * 1.2;
+  return { mode, d, s, p, id: ph.id, L: levelOf(d, s, p, 0.5), near, dens, gap, aimed, occ, dodge };
 }
 
 const rows: Row[] = [];
 for (let d = 0; d < 4; d++) {
-  for (let m = 0; m < 2; m++) {
+  for (let m = 0; m < 1; m++) { // まず回避弾幕
     const table = STAGE_TABLES[m];
     for (let s = 0; s < table.length; s++) {
       for (let p = 0; p < table[s].phases.length; p++) {
-        const r = measurePhase(m, d, s, p, table);
+        const r = measure(m, d, s, p);
         if (r) rows.push(r);
       }
     }
   }
 }
 
-const KSTAR = '══════════════════════════════════════════════════════════════';
-for (const m of [0, 1]) {
-  const sub = rows.filter((r) => r.mode === m);
-  if (!sub.length) continue;
-  const title = m === 0 ? '回避弾幕' : '無限ジャンプ';
-  console.log(`\n${KSTAR}\n モード${m} ${title}\n${KSTAR}`);
-  console.log('  d s p   id      L(mid)   実測T   目標T   T/目標   弾数(平均/最大)  弾速  判定');
-  let bad = 0;
-  for (const r of sub) {
-    const dev = Math.abs(r.ratio - 1);
-    const mark = dev < 0.15 ? 'OK' : dev < 0.35 ? '△' : '×';
-    if (dev >= 0.35) bad++;
-    console.log(
-      `  ${r.d} ${r.s} ${r.p}  ${r.id.padEnd(6)}  ${r.Lmid.toFixed(3)}  ${r.live.toFixed(0).padStart(6)}  ` +
-      `${r.target.toFixed(0).padStart(6)}  ${r.ratio.toFixed(2).padStart(6)}   ${r.alive.toFixed(0).padStart(4)}/${r.peak.toString().padStart(4)}  ` +
-      `${r.speed.toFixed(2).padStart(5)}  ${mark}`
-    );
-  }
-  console.log(`  ── 目標から35%以上ずれたフェーズ: ${bad} / ${sub.length}`);
-
-  // ステージ単位の単調性（フェーズ単位は±10%の形の差を許容）
-  let mono = true;
-  const badPair: string[] = [];
-  for (let d = 0; d < 4; d++) {
-    const seq: number[] = [];
-    const nStage = Math.max(...sub.filter((r) => r.d === d).map((r) => r.s)) + 1;
-    for (let s = 0; s < nStage; s++) {
-      const ph = sub.filter((r) => r.d === d && r.s === s).map((r) => r.live);
-      seq.push(ph.reduce((a, b) => a + b, 0) / ph.length);
-    }
-    for (let i = 1; i < seq.length; i++) {
-      if (seq[i] < seq[i - 1] * 0.97) { mono = false; badPair.push(`d${d}:s${i}→s${i + 1}`); }
-    }
-  }
-  console.log(`  ── ステージ単位の単調増加（実測T平均）: ${mono ? 'OK' : 'NG ' + badPair.join(' ')}`);
-  // 難易度の順序（前の難易度の最大 vs 次の難易度の最小）
-  const mn: number[] = [];
-  const mx: number[] = [];
-  for (let d = 0; d < 4; d++) {
-    const seq = sub.filter((r) => r.d === d);
-    mn.push(Math.min(...seq.map((r) => r.live)));
-    mx.push(Math.max(...seq.map((r) => r.live)));
-  }
-  console.log(`  ── 難易度帯の分離: ` + mn.map((v, i) => `d${i}[${v.toFixed(0)}–${mx[i].toFixed(0)}]`).join(' '));
+console.log('d s p  id      L      near   dens   gap   aim   occ   DODGE');
+for (const r of rows) {
+  console.log(
+    `${r.d} ${r.s} ${r.p}  ${r.id.padEnd(6)} ${r.L.toFixed(2)}  ${r.near.toFixed(2).padStart(5)}  ${r.dens.toFixed(1).padStart(5)}  ${r.gap.toFixed(0).padStart(4)}  ${r.aimed.toFixed(1).padStart(4)}  ${r.occ.toFixed(2)}  ${r.dodge.toFixed(2).padStart(6)}`
+  );
 }
 
-if (process.argv.includes('--cal')) {
-  const ids: string[] = [];
-  const vals: number[] = [];
-  const byId = new Map<string, number[]>();
-  for (const r of rows) {
-    if (!byId.has(r.id)) byId.set(r.id, []);
-    byId.get(r.id)!.push(r.ratio);
+// 難易度ごとの平均 DODGE と単調性
+console.log('\n── 難易度平均 DODGE（ステージ別）──');
+for (let d = 0; d < 4; d++) {
+  const byS: number[] = [];
+  for (let s = 0; s < 6; s++) {
+    const ph = rows.filter((r) => r.d === d && r.s === s);
+    byS.push(ph.reduce((a, b) => a + b.dodge, 0) / ph.length);
   }
-  console.log('\n// ── PATTERN_CAL 提案（実測比の平均で 1.00 になるよう補正）──');
-  for (const [id, ratios] of byId) {
-    const avg = ratios.reduce((a, b) => a + b, 0) / ratios.length;
-    const cur = PATTERN_CAL[id] ?? 1;
-    const next = cur / avg;
-    ids.push(id); vals.push(next);
-    console.log(`  ${id}: ${next.toFixed(2)},   // 実測比 avg ${avg.toFixed(2)} / 現 cal ${cur.toFixed(2)}`);
+  console.log(`d${d}: ` + byS.map((v) => v.toFixed(2)).join(' → ') + `  | avg ${ (byS.reduce((a,b)=>a+b,0)/byS.length).toFixed(2)}`);
+}
+// 同ステージ・同フェーズでの d 上昇比
+console.log('\n── 同一フェーズ d0→d3 の DODGE 比 ──');
+for (let s = 0; s < 6; s++) {
+  for (let p = 0; p < STAGE_TABLES[0][s].phases.length; p++) {
+    const a = rows.find((r) => r.d === 0 && r.s === s && r.p === p)!;
+    const b = rows.find((r) => r.d === 3 && r.s === s && r.p === p)!;
+    console.log(`  ${a.id}: ${a.dodge.toFixed(2)} → ${b.dodge.toFixed(2)}  ×${(b.dodge / a.dodge).toFixed(2)}`);
   }
 }
