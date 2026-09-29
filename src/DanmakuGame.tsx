@@ -4,7 +4,7 @@ import { Maximize2, Volume2, VolumeX, Pause, Play, Lock, ChevronRight, RotateCcw
 import { Engine, type RunResult } from './game/engine';
 import {
   MODES, DIFFS, N_STAGES, N_STAGES_JUMP, STAGE_TABLES, W, H, SAVE_KEY, OLD_SAVE_KEY,
-  ENDING_LINES_ALL, defaultProgress, isDiffUnlocked, modeCleared, stageLabel,
+  ENDING_LINES_ALL, defaultProgress, isDiffUnlocked, modeCleared, stageLabel, levelOf,
   KEY_DEFS, defaultKeys, codeLabel, KEYS_SAVE_KEY,
   type ModeId, type Progress, type KeyMap, type KeyAction,
 } from './game/data';
@@ -404,12 +404,12 @@ export default function DanmakuGame() {
       />
       <div className="pointer-events-none absolute inset-y-0 left-0 hidden w-[calc(50%-260px)] items-center justify-center lg:flex">
         <div className="text-[#ffffff08] text-[22vh] leading-none" style={{ ...DISPLAY, writingMode: 'vertical-rl' }}>
-          ✝本質✝
+          ✝弾幕✝
         </div>
       </div>
       <div className="pointer-events-none absolute inset-y-0 right-0 hidden w-[calc(50%-260px)] items-center justify-center lg:flex">
         <div className="text-[#ffffff08] text-[9vh] leading-tight" style={{ ...MINCHO, writingMode: 'vertical-rl' }}>
-          偏差値60の教室から漏れ出している
+          偏差値60の教室から弾幕が漏れ出してる件について
         </div>
       </div>
 
@@ -426,9 +426,9 @@ export default function DanmakuGame() {
                 className="my-1 bg-gradient-to-b from-white via-rose-100 to-rose-400 bg-clip-text text-6xl leading-tight text-transparent drop-shadow-[0_0_24px_rgba(255,80,120,0.55)] sm:text-8xl"
                 style={DISPLAY}
               >
-                ✝本質✝
+                ✝弾幕✝
               </div>
-              <div className="text-base text-white/90 sm:text-xl" style={MINCHO}>が漏れ出している件について</div>
+              <div className="text-base text-white/90 sm:text-xl" style={MINCHO}>が漏れ出してる件について</div>
               <button
                 onClick={goSelect}
                 className="group mt-10 flex items-center gap-2 rounded-sm border border-rose-300/60 bg-rose-900/40 px-8 py-3 text-sm tracking-[0.3em] text-white transition hover:bg-rose-700/60 hover:shadow-[0_0_30px_rgba(255,80,120,0.5)]"
@@ -502,13 +502,49 @@ export default function DanmakuGame() {
                 })}
               </div>
 
-              <div className="mt-3 flex-1 px-4 text-[11px] leading-relaxed text-white/65" style={MINCHO}>
-                <div>
-                  {mode.name}・{diff.name}（偏差値{diff.hensachi}）— {stageLabel(N_STAGES_BY_MODE[selM], 0)} から{' '}
-                  {stageLabel(N_STAGES_BY_MODE[selM], N_STAGES_BY_MODE[selM] - 1)} まで一気に
+              {/* ステージ・フェーズ一覧 */}
+              <div className="mt-2 min-h-0 flex-1 overflow-y-auto px-3 py-1 text-[11px] leading-relaxed text-white/75" style={MINCHO}>
+                <div className="mb-1.5 flex items-center justify-between text-[10px] text-white/50">
+                  <span>
+                    {mode.name}・{diff.name}（偏差値{diff.hensachi}）
+                  </span>
+                  <span>残機 {diff.lives} ／「は？」 {diff.bombs}</span>
                 </div>
-                <div className="mt-1 text-white/45">残機 {diff.lives} ／「は？」 {diff.bombs}</div>
-                <div className="mt-2 text-white/50">{controlLine(selM, keys)}</div>
+                <div className="space-y-2">
+                  {STAGE_TABLES[selM].map((st, sIdx) => {
+                    const sLabel = stageLabel(N_STAGES_BY_MODE[selM], sIdx);
+                    return (
+                      <div key={st.title} className="rounded-sm border border-white/10 bg-white/[0.02] p-2">
+                        <div className="flex items-baseline justify-between border-b border-white/10 pb-1">
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-[9px] tracking-wider font-bold" style={{ color: st.color }}>
+                              {sLabel}
+                            </span>
+                            <span className="text-xs text-white/90 font-medium">{st.boss}</span>
+                            <span className="text-[10px] text-white/45">「{st.title}」</span>
+                          </div>
+                        </div>
+                        <div className="mt-1 space-y-0.5">
+                          {st.phases.map((ph, pIdx) => {
+                            const lv = levelOf(selD, sIdx, pIdx, 0).toFixed(2);
+                            return (
+                              <div key={ph.id} className="flex items-center justify-between text-[10px] text-white/70">
+                                <span className="truncate pr-2">
+                                  <span className="text-white/40 mr-1">P{pIdx + 1}</span>
+                                  {ph.name}
+                                </span>
+                                <span className="shrink-0 font-mono text-white/50">
+                                  {ph.dur}秒<span className="mx-1 text-white/30">/</span>難易度 Lv.{lv}（偏差値{diff.hensachi}）
+                                </span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="mt-2 text-[10px] text-white/40">{controlLine(selM, keys)}</div>
               </div>
 
               <div className="flex items-center justify-between gap-2 border-t border-white/10 px-4 py-3">
