@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
-import { Maximize2, Volume2, VolumeX, Pause, Play, Lock, ChevronRight, RotateCcw, Home, Trophy, Check, Keyboard } from 'lucide-react';
+import { Maximize2, Volume2, VolumeX, Pause, Play, Lock, ChevronRight, RotateCcw, Home, Trophy, Check, Keyboard, Copy, Image as ImageIcon } from 'lucide-react';
 import { Engine, type RunResult } from './game/engine';
 import {
   MODES, DIFFS, N_STAGES, N_STAGES_JUMP, STAGE_TABLES, W, H, SAVE_KEY, OLD_SAVE_KEY,
@@ -10,6 +10,31 @@ import {
 } from './game/data';
 
 type Screen = 'title' | 'select' | 'playing' | 'paused' | 'result' | 'keys';
+
+/** dataURL PNG をクリップボードへ（対応ブラウザ）。失敗時はダウンロードにフォールバック */
+async function copyImageToClipboard(dataUrl: string): Promise<'copied' | 'downloaded' | 'failed'> {
+  try {
+    const res = await fetch(dataUrl);
+    const blob = await res.blob();
+    if (typeof ClipboardItem !== 'undefined' && navigator.clipboard && 'write' in navigator.clipboard) {
+      await navigator.clipboard.write([new ClipboardItem({ [blob.type || 'image/png']: blob })]);
+      return 'copied';
+    }
+  } catch {
+    /* フォールバックへ */
+  }
+  try {
+    const a = document.createElement('a');
+    a.href = dataUrl;
+    a.download = `honshitsu-clear-${Date.now()}.png`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    return 'downloaded';
+  } catch {
+    return 'failed';
+  }
+}
 
 const DISPLAY: CSSProperties = { fontFamily: '"Dela Gothic One", "Hiragino Sans", sans-serif' };
 const MINCHO: CSSProperties = { fontFamily: '"Shippori Mincho B1", "Hiragino Mincho ProN", "Yu Mincho", serif' };
@@ -130,6 +155,11 @@ export default function DanmakuGame() {
   const [keysFrom, setKeysFrom] = useState<Screen>('title');
   const [size, setSize] = useState({ w: W, h: H });
   const [isTouch] = useState<boolean>(() => typeof window !== 'undefined' && !!window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+  /** 直近のクリア画像（ステージ／ALL）— リザルト画面で再コピー可 */
+  const [clearShot, setClearShot] = useState<{ url: string; kind: 'stage' | 'all' } | null>(null);
+  const [copyMsg, setCopyMsg] = useState<string | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
+  const toastTimer = useRef<number>(0);
 
   useEffect(() => {
     progressRef.current = progress;
@@ -184,6 +214,22 @@ export default function DanmakuGame() {
         setScreen('result');
       },
       onPause: (p) => setScreen(p ? 'paused' : 'playing'),
+      onClearShot: (url, kind) => {
+        setClearShot({ url, kind });
+        // 自動でクリップボードへ。プレイ中トーストで知らせる
+        void copyImageToClipboard(url).then((r) => {
+          const label = kind === 'all' ? 'ALL CLEAR' : 'STAGE CLEAR';
+          const msg =
+            r === 'copied' ? `${label} 画像をクリップボードにコピーした`
+              : r === 'downloaded' ? `${label} 画像をダウンロードした`
+                : null;
+          if (msg) {
+            setToast(msg);
+            window.clearTimeout(toastTimer.current);
+            toastTimer.current = window.setTimeout(() => setToast(null), 2800);
+          }
+        });
+      },
     });
     eng.setKeys(keysRef.current);
     engineRef.current = eng;
@@ -228,9 +274,23 @@ export default function DanmakuGame() {
     eng.audio.select();
     setNewUnlock(null);
     setResult(null);
+    setClearShot(null);
+    setCopyMsg(null);
+    setToast(null);
     eng.startRun(m, d, progressRef.current.stats[m][d].hi);
     setScreen('playing');
   }, [ensureAudio]);
+
+  const copyClearShot = useCallback(async () => {
+    if (!clearShot) return;
+    const r = await copyImageToClipboard(clearShot.url);
+    setCopyMsg(
+      r === 'copied' ? 'コピーした'
+        : r === 'downloaded' ? 'ダウンロードした'
+          : 'コピーできなかった',
+    );
+    window.setTimeout(() => setCopyMsg(null), 2200);
+  }, [clearShot]);
 
   const resume = useCallback(() => {
     engineRef.current?.setPaused(false);
@@ -678,6 +738,29 @@ export default function DanmakuGame() {
                   難易度「{DIFFS[newUnlock.d].name}（偏差値{DIFFS[newUnlock.d].hensachi}）」解禁
                 </div>
               )}
+              {clearShot && (
+                <div className="mt-4 flex w-full max-w-[280px] flex-col items-center gap-2">
+                  <div className="overflow-hidden rounded-sm border border-white/20 shadow-[0_0_24px_rgba(255,100,150,0.25)]">
+                    <img
+                      src={clearShot.url}
+                      alt={clearShot.kind === 'all' ? 'ALL CLEAR' : 'STAGE CLEAR'}
+                      className="block max-h-36 w-auto"
+                      style={{ imageRendering: 'auto' }}
+                    />
+                  </div>
+                  <button
+                    onClick={() => void copyClearShot()}
+                    className="flex w-52 items-center justify-center gap-2 rounded-sm border border-pink-300/50 bg-pink-900/30 py-2 text-sm text-pink-100 hover:bg-pink-800/40"
+                  >
+                    <Copy className="h-4 w-4" />
+                    {copyMsg ?? (clearShot.kind === 'all' ? 'クリア画像をコピー' : 'ステージクリア画像をコピー')}
+                  </button>
+                  <div className="flex items-center gap-1 text-[10px] text-white/45">
+                    <ImageIcon className="h-3 w-3" />
+                    クリア時に自動でクリップボードへも送っています
+                  </div>
+                </div>
+              )}
               <div className="mt-5 flex flex-col gap-2">
                 <button onClick={retry} className="flex w-52 items-center justify-center gap-2 rounded-sm border border-white/60 py-2 text-sm hover:bg-white/10">
                   <RotateCcw className="h-4 w-4" /> もう一度ステージ1から
@@ -705,6 +788,13 @@ export default function DanmakuGame() {
           )}
         </div>
       </div>
+
+      {/* ── Clear-shot toast ─────────────────────────────── */}
+      {toast && (
+        <div className="pointer-events-none absolute bottom-6 left-1/2 z-20 -translate-x-1/2 rounded-sm border border-pink-300/40 bg-black/80 px-4 py-2 text-xs tracking-wider text-pink-100 shadow-[0_0_24px_rgba(255,80,120,0.35)]">
+          {toast}
+        </div>
+      )}
 
       {/* ── Global controls ─────────────────────────────── */}
       <div className="absolute right-2 top-2 z-10 flex gap-1">

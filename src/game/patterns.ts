@@ -1,21 +1,21 @@
 // ─────────────────────────────────────────────────────────────
-//  弾幕パターン — 全パラメタは難度係数 L の3倍率（sp/dn/R）と
-//                パターン別較正係数 cal だけで決まる。
+//  弾幕パターン — 難度は「画面下部の自機がどれだけ避けにくいか」。
 //
-//  設計規則（これを破ると「係数と実際の難しさ」がずれる）:
-//   ・弾数     : g.n(基準本数)      = 基準 × denMul(L) × cal
+//  設計規則（これを破ると係数と実プレイ感がずれる）:
+//   ・弾数     : g.n(基準本数)       = 基準 × denMul(L) × cal
 //   ・発射頻度 : g.tick(k, 基準間隔) = 基準間隔 / rateMul(L)
-//   ・壁・帯   : g.fw(k, 基準間隔)  = 頻度に denMul も掛ける（本数を増やせない形）
-//   ・弾速     : g.v(g, 基準速度)      = 基準 × spdMul(L)
+//   ・壁・帯   : g.fw(k, 基準間隔)   = 頻度に denMul も掛ける
+//   ・弾速     : g.v(基準速度)       = 基準 × spdMul(L)
+//   ・逃げ道幅 : g.gap(基準px)       = 基準 × gapMul(L)   ← 下部の本質
+//   ・追尾・扇 : g.track(基準)       = 基準 × trackMul(L) ← 狙いの厳しさ
 //   ・L を直接読む閾値（L >= 1 など）は禁止。すべて上の倍率で連続に変化させる。
 //
-//  基準値は「難度係数 L の強度カーブ」に実測で載るように較正済み
-//  （tools/measure.ts で全フェーズの実測比が 1.00 ± 0.15 に収まることを検証）。
+//  弾の総量 T だけでなく、隙間・反応時間・狙いの収束が L に比例すること。
 // ─────────────────────────────────────────────────────────────
 import type { Engine } from './engine';
 import {
   W, H, TAU,
-  T_SMALL, T_MED, T_LARGE, T_RICE, T_KUNAI, T_CROSS, T_STAR, T_HEART, T_PETAL,
+  T_SMALL, T_MED, T_LARGE, T_RICE, T_KUNAI, T_CROSS, T_STAR, T_HEART,
   C_RED, C_ORANGE, C_YELLOW, C_GREEN, C_CYAN, C_BLUE, C_VIOLET, C_PINK, C_WHITE, RAINBOW,
   B_POLAR, B_GRAVITY, B_SINE, B_STEP, B_SPLIT, B_HOMING, B_LINEAR,
   FL_STOP, FL_FADE, FL_SUPER, FL_NOCULL,
@@ -83,48 +83,58 @@ const ROSE_K: readonly number[] = [2, 3, 5, 4, 2.5, 7, 1.5, 6];
 
 export const PATTERNS: Record<string, PatternDef> = {
   // ═══ STAGE 1 両馬二郎 ═══════════════════════════════════
-  // 環（減速する中弾）＋ 自機狙い
+  // 環（減速する中弾）＋ 自機狙い — 扇の狭さが track で締まる
   s1p1: {
     update(g, t) {
       if (g.tick(0, 32)) {
         const n = g.n(22);
         const odd = g.cnt[0]++ & 1;
         const a0 = g.rnd() * TAU;
+        // 環の角速度も L で増える → 下部での逃げ道が回転で塞がる
+        const spin = (odd ? 1 : -1) * 0.0022 * g.track();
         for (let k = 0; k < n; k++) {
           const i = g.spawn(g.bossX, g.bossY, a0 + (k * TAU) / n, g.v(1.55), T_MED, odd ? C_ORANGE : C_YELLOW);
           if (i < 0) break;
           g.bacc[i] = -0.006;
           g.bmin[i] = g.v(0.95);
-          g.bav[i] = odd ? 0.003 : -0.003;
+          g.bav[i] = spin;
         }
         g.shot();
       }
       if (t > 60 && g.tick(1, 90)) {
-        aimedFan(g, g.bossX, g.bossY, g.n(1.6), 0.16, g.v(2.3), T_SMALL, C_WHITE);
+        // 扇の開き角を track で狭める（高難度ほど一点に収束）
+        const spread = 0.22 / g.track();
+        aimedFan(g, g.bossX, g.bossY, g.n(1.6), spread, g.v(2.3), T_SMALL, C_WHITE);
       }
     },
   },
-  // 上から落ちる壁（隙間が動く）＋ 自機狙い苦無
+  // 上から落ちる壁（隙間が gapMul で狭まる）＋ 自機狙い苦無
   s1p2: {
     init(g) {
       g.wander = false;
       g.moveBoss(W / 2, 100, 60);
     },
-    update(g, t, L) {
+    update(g, t) {
       if (t % 120 === 0) g.moveBoss(W / 2 + (g.rnd() - 0.5) * 160, 88 + g.rnd() * 30, 110);
       if (g.fw(0, 58)) {
-        const gap = Math.max(46, 84 - 7 * L);
-        let gx = W / 2 + Math.sin(g.phaseT * 0.013) * 150 + (g.rnd() - 0.5) * 60;
+        // 基準 100px → L=0:100 / L=1:62 / L=2:43 / L=3:33 / L=3.9:28
+        const gap = g.gap(100, 26);
+        // 隙間の横揺れ幅も L で増えて予測しづらく
+        const sway = 90 + 70 * g.track();
+        let gx = W / 2 + Math.sin(g.phaseT * 0.013) * sway + (g.rnd() - 0.5) * (40 + 30 * g.tr);
         const lo = gap / 2 + 10;
         if (gx < lo) gx = lo;
         if (gx > W - lo) gx = W - lo;
-        for (let x = 6; x <= W - 6; x += 15) {
+        // 弾間隔も密に（高密度ほど隙間が「線」になる）
+        const step = Math.max(9, 16 - 2.5 * g.dn);
+        for (let x = 6; x <= W - 6; x += step) {
           if (Math.abs(x - gx) < gap / 2) continue;
-          if (g.spawn(x, -46 + 30 * (1 - ((x - W / 2) / (W / 2)) ** 2), PI / 2, g.v(1.3), T_SMALL, C_CYAN) < 0) break;
+          if (g.spawn(x, -46 + 30 * (1 - ((x - W / 2) / (W / 2)) ** 2), PI / 2, g.v(1.35), T_SMALL, C_CYAN) < 0) break;
         }
       }
-      if (t > 30 && g.tick(1, 110)) {
-        aimedFan(g, g.bossX, g.bossY, g.n(2.6), 0.12, g.v(2.2), T_KUNAI, C_RED);
+      if (t > 30 && g.tick(1, 100)) {
+        const spread = 0.18 / g.track();
+        aimedFan(g, g.bossX, g.bossY, g.n(2.6), spread, g.v(2.3), T_KUNAI, C_RED);
         g.shot();
       }
     },
@@ -138,7 +148,8 @@ export const PATTERNS: Record<string, PatternDef> = {
     update(g, _t) {
       if (g.tick(0, 7)) {
         const arms = g.n(4);
-        g.fv[0] += 0.16;
+        // 螺旋の巻き速度も track で加速 → 下部で腕が重なる
+        g.fv[0] += 0.12 + 0.08 * g.track();
         for (let k = 0; k < arms; k++) {
           if (g.spawn(g.bossX, g.bossY, g.fv[0] + (k * TAU) / arms, g.v(1.8), T_CROSS, C_VIOLET) < 0) break;
         }
@@ -147,7 +158,9 @@ export const PATTERNS: Record<string, PatternDef> = {
       if (g.tick(1, 52)) {
         const c = g.n(1.6);
         for (let k = 0; k < c; k++) {
-          const i = g.spawn(20 + g.rnd() * (W - 40), -8, PI / 2 + (g.rnd() - 0.5) * 0.3, g.v(1.0 + g.rnd() * 0.9), T_CROSS, C_YELLOW);
+          // 下部に届く落下弾：横ブレを小さくして逃げ道を限定
+          const drift = 0.35 / g.track();
+          const i = g.spawn(20 + g.rnd() * (W - 40), -8, PI / 2 + (g.rnd() - 0.5) * drift, g.v(1.0 + g.rnd() * 0.9), T_CROSS, C_YELLOW);
           if (i >= 0) g.bghost[i] = 24;
         }
       }
@@ -155,18 +168,21 @@ export const PATTERNS: Record<string, PatternDef> = {
   },
 
   // ═══ STAGE 2 塀勝也 ═════════════════════════════════════
-  // 構造線レーザー ＋ 自機狙い環 ＋ 左右からの米弾
+  // 構造線レーザー ＋ 自機狙い環 ＋ 左右からの米弾（下部帯を重点）
   s2p1: {
     init(g) {
       g.wander = false;
       g.moveBoss(W / 2, 110, 60);
     },
     update(g, t) {
-      if (t % 300 === 0) {
+      // レーザー間隔・幅が L で厳しく（反応時間が削られる）
+      const laserCyc = Math.max(160, Math.round(300 / (0.7 + 0.3 * g.R)));
+      if (t % laserCyc === 0) {
         const flip = g.cnt[1]++ & 1;
         const x0 = W * (0.3 + g.rnd() * 0.4);
         const x1 = x0 + (flip ? 1 : -1) * (60 + g.rnd() * 60);
-        g.laser(x0, -20, Math.atan2(H + 60, x1 - x0), 900, 14, 70, 130, C_ORANGE, 0);
+        const w = 10 + 6 * g.track();
+        g.laser(x0, -20, Math.atan2(H + 60, x1 - x0), 900, w, 70, 130, C_ORANGE, 0);
       }
       if (g.tick(0, 62)) {
         const n = g.n(26) & ~1;
@@ -178,33 +194,39 @@ export const PATTERNS: Record<string, PatternDef> = {
       }
       if (g.tick(1, 38)) {
         const c = g.n(1.2);
+        // 米弾の Y 帯を下部寄りに寄せ、高難度ほど自機ラインを狙う
+        const yBias = 0.35 + 0.35 * g.track();
         for (let k = 0; k < c; k++) {
-          let i = g.spawn(-6, 40 + g.rnd() * 300, 0.25 + (g.rnd() - 0.5) * 0.5, g.v(1.5), T_RICE, C_RED);
+          const y = 80 + g.rnd() * 200 + yBias * 220;
+          let i = g.spawn(-6, Math.min(H - 40, y), 0.15 + (g.rnd() - 0.5) * 0.35, g.v(1.55), T_RICE, C_RED);
           if (i >= 0) g.bghost[i] = 16;
-          i = g.spawn(W + 6, 40 + g.rnd() * 300, PI - 0.25 + (g.rnd() - 0.5) * 0.5, g.v(1.5), T_RICE, C_WHITE);
+          i = g.spawn(W + 6, Math.min(H - 40, y + (g.rnd() - 0.5) * 40), PI - 0.15 + (g.rnd() - 0.5) * 0.35, g.v(1.55), T_RICE, C_WHITE);
           if (i >= 0) g.bghost[i] = 16;
         }
       }
     },
   },
-  // 段丘の壁（一定リズムで迫る）＋ 自機狙い ＋ 落ちる粒
+  // 段丘の壁（隙間が gapMul で狭まる）＋ 自機狙い ＋ 落ちる粒
   s2p2: {
     init(g) {
       g.wander = false;
       g.moveBoss(W / 2, 90, 60);
       g.fv[0] = W / 2;
     },
-    update(g, t, L) {
+    update(g, t) {
       const s = Math.sin((g.phaseT * TAU) / 90);
-      g.stepF = s > 0 ? s * s * s * 2.2 : 0;
+      // 段差の加速も L で強くなる → 隙間を通る時間が減る
+      g.stepF = s > 0 ? s * s * s * (1.8 + 0.7 * g.track()) : 0;
       if (g.fw(0, 150)) {
-        const gap = Math.max(58, 92 - 8 * L);
-        g.fv[0] += (g.rnd() - 0.5) * 180;
+        const gap = g.gap(110, 28);
+        // 隙間のジャンプ幅も大きく → 予測しづらい
+        g.fv[0] += (g.rnd() - 0.5) * (120 + 80 * g.tr);
         const lo = gap / 2 + 12;
         if (g.fv[0] < lo) g.fv[0] = lo;
         if (g.fv[0] > W - lo) g.fv[0] = W - lo;
         const gx = g.fv[0];
-        for (let x = 6; x <= W - 6; x += 14) {
+        const step = Math.max(9, 15 - 2.2 * g.dn);
+        for (let x = 6; x <= W - 6; x += step) {
           if (Math.abs(x - gx) < gap / 2) continue;
           const i = g.spawn(x, -20, PI / 2, g.v(1.7), T_SMALL, C_YELLOW);
           if (i < 0) break;
@@ -212,13 +234,16 @@ export const PATTERNS: Record<string, PatternDef> = {
         }
       }
       if (t > 20 && g.tick(1, 44)) {
-        aimedFan(g, g.bossX, g.bossY, g.n(2.5), 0.22, g.v(1.3), T_MED, C_BLUE);
+        const spread = 0.28 / g.track();
+        aimedFan(g, g.bossX, g.bossY, g.n(2.5), spread, g.v(1.35), T_MED, C_BLUE);
         g.shot();
       }
       if (g.tick(2, 40)) {
         const c = g.n(1.8);
         for (let k = 0; k < c; k++) {
-          g.spawn(g.bossX, g.bossY, PI / 2 + (g.rnd() - 0.5) * 1.6, g.v(0.9 + g.rnd() * 0.6), T_SMALL, C_GREEN);
+          // 落下粒の扇を track で狭めて下部中央を塞ぐ
+          const fan = 1.8 / g.track();
+          g.spawn(g.bossX, g.bossY, PI / 2 + (g.rnd() - 0.5) * fan, g.v(0.9 + g.rnd() * 0.6), T_SMALL, C_GREEN);
         }
       }
     },
@@ -232,26 +257,30 @@ export const PATTERNS: Record<string, PatternDef> = {
         const p2 = g.rnd() * TAU;
         const a0 = g.rnd() * TAU;
         const col = g.cnt[0]++ & 1 ? C_GREEN : C_CYAN;
+        // 波の振幅を L で強め、遅い部分と速い部分の差＝逃げ道のゆらぎを拡大
+        const a1 = 0.22 + 0.14 * g.track();
+        const a2 = 0.12 + 0.12 * g.track();
         for (let k = 0; k < n; k++) {
           const th = a0 + (k * TAU) / n;
-          const m = 1 + 0.28 * Math.sin(3 * th + p1) + 0.18 * Math.sin(5 * th + p2);
+          const m = 1 + a1 * Math.sin(3 * th + p1) + a2 * Math.sin(5 * th + p2);
           if (g.spawn(g.bossX, g.bossY, th, g.v(1.35) * m, T_SMALL, col) < 0) break;
         }
         g.shot();
       }
       if (t > 40 && g.tick(1, 75)) {
-        aimedFan(g, g.bossX, g.bossY, g.n(2.2), 0.1, g.v(2.6), T_KUNAI, C_WHITE);
+        const spread = 0.14 / g.track();
+        aimedFan(g, g.bossX, g.bossY, g.n(2.2), spread, g.v(2.6), T_KUNAI, C_WHITE);
       }
     },
   },
-  // 窓の外の五秒：滞空する弾 → 時間停止 → 一斉に自機へ
+  // 窓の外の五秒：滞空する弾 → 時間停止 → 一斉に自機へ（収束が track で厳しく）
   s2p4: {
     init(g) {
       g.wander = false;
       g.moveBoss(W / 2, 140, 60);
     },
     update(g, t) {
-      const cyc = Math.max(190, Math.round(440 / g.R));
+      const cyc = Math.max(170, Math.round(420 / g.R));
       const c = t % cyc;
       const parkEnd = Math.round(cyc * 0.45);
       const stopAt = Math.round(cyc * 0.49);
@@ -273,12 +302,13 @@ export const PATTERNS: Record<string, PatternDef> = {
         g.popText(W / 2, 250, POP_WINDOW);
       }
       if (c === releaseAt) {
-        const jitter = 0.05 + 0.04 * g.dn;
+        // 高難度ほど一斉収束のジッターが消える＝真下に落ちてくる
+        const jitter = (0.12 + 0.06 * g.dn) / g.track();
         for (let i = 0; i < g.bn; i++) {
           if (!(g.bflg[i] & FL_STOP)) continue;
           g.ba[i] = g.aim(g.bx[i], g.by[i]) + (g.rnd() - 0.5) * jitter;
           g.bs[i] = 0;
-          g.bacc[i] = 0.018 + g.rnd() * 0.02;
+          g.bacc[i] = 0.018 + g.rnd() * 0.02 + 0.006 * g.sp;
           g.bmax[i] = g.v(1.8 + g.rnd() * 1.0);
           g.bmin[i] = 0;
           g.bflg[i] &= ~FL_STOP;
@@ -288,27 +318,35 @@ export const PATTERNS: Record<string, PatternDef> = {
   },
 
   // ═══ STAGE 3 寺地星 ═════════════════════════════════════
-  // コメント弾幕（文字の塊が飛んでくる）
+  // コメント弾幕 — レーン間隔が gapMul で狭まり、下部レーンが増える
   s3p1: {
     update(g, t) {
-      if (g.fw(0, 150)) {
-        let lane = Math.floor(g.rnd() * 11);
-        if (lane === g.cnt[1]) lane = (lane + 4) % 11;
+      // 発射間隔も den 依存（fw）で詰める：コメント密度＝逃げにくさ
+      if (g.fw(0, 120)) {
+        const lanes = Math.max(9, Math.round(10 + 5 * g.dn));
+        let lane = Math.floor(g.rnd() * lanes);
+        if (lane === g.cnt[1]) lane = (lane + Math.floor(lanes / 3)) % lanes;
         g.cnt[1] = lane;
-        const y = 44 + lane * 46 + (g.rnd() - 0.5) * 10;
-        const spd = g.v(1.5 + g.rnd() * 1.2);
+        const top = 36;
+        const bot = H - 40;
+        const ySpan = bot - top;
+        // 使用レーンを gap で圧縮 → レーン間の隙間が物理的に狭い
+        const used = Math.max(7, Math.round(lanes * (0.6 + 0.4 * (1 - g.gp))));
+        const y = top + ((lane % used) / Math.max(1, used - 1)) * ySpan + (g.rnd() - 0.5) * 6;
+        const spd = g.v(1.55 + g.rnd() * 1.25);
         const kind = g.rnd();
         let x = W + 14;
-        if (kind < 0.6) {
-          const reps = 1 + Math.floor(g.rnd() * 2);
-          for (let r = 0; r < reps; r++) x += glyphBullets(g, GLYPH_W, x, y, 6, spd, C_GREEN) + 8;
-        } else if (kind < 0.85) {
-          glyphBullets(g, GLYPH_KUSA, x, y, 6, spd, C_GREEN);
+        const cell = Math.max(4.2, 6.2 - 0.7 * g.dn);
+        if (kind < 0.55) {
+          const reps = 1 + Math.floor(g.rnd() * (1 + g.dn));
+          for (let r = 0; r < reps; r++) x += glyphBullets(g, GLYPH_W, x, y, cell, spd, C_GREEN) + 6;
+        } else if (kind < 0.82) {
+          glyphBullets(g, GLYPH_KUSA, x, y, cell, spd, C_GREEN);
         } else {
-          glyphBullets(g, GLYPH_CROSS, x, y, 6, spd, C_WHITE);
+          glyphBullets(g, GLYPH_CROSS, x, y, cell, spd, C_WHITE);
         }
       }
-      if (t > 20 && g.fw(1, 160)) {
+      if (t > 20 && g.fw(1, 140)) {
         const per = g.n(5.5);
         const rot = (g.rnd() - 0.5) * 0.6;
         const cr = Math.cos(rot);
@@ -332,16 +370,17 @@ export const PATTERNS: Record<string, PatternDef> = {
       }
     },
   },
-  // 重力井戸（光速に近づくほど重くなる）
+  // 重力井戸（引力が track で強まり、下部へ引きずり込む）
   s3p2: {
     init(g) {
       g.wellOn = true;
-      g.wellG = 260 * g.sp;
+      g.wellG = 260 * g.sp * g.track();
     },
     update(g, t) {
       g.wellX = W / 2 + Math.cos(g.phaseT * 0.008) * 120;
-      g.wellY = 320 + Math.sin(g.phaseT * 0.011) * 70;
-      g.wellG = 260 * g.sp;
+      // 井戸を少し下へ — 自機帯に近いほど危険
+      g.wellY = 300 + 40 * g.track() + Math.sin(g.phaseT * 0.011) * 70;
+      g.wellG = 220 * g.sp * g.track();
       if (g.tick(0, 40)) {
         const n = g.n(16);
         const a0 = g.rnd() * TAU;
@@ -359,11 +398,12 @@ export const PATTERNS: Record<string, PatternDef> = {
         g.shot();
       }
       if (t > 40 && g.tick(1, 90)) {
-        aimedFan(g, g.bossX, g.bossY, g.n(1.6), 0.14, g.v(2.4), T_KUNAI, C_WHITE);
+        const spread = 0.18 / g.track();
+        aimedFan(g, g.bossX, g.bossY, g.n(1.6), spread, g.v(2.4), T_KUNAI, C_WHITE);
       }
     },
   },
-  // 三つ星（三連エミッタ）
+  // 三つ星（三連エミッタ）— 落下粒が下部を塞ぐ
   s3p3: {
     init(g) {
       g.wander = false;
@@ -388,10 +428,12 @@ export const PATTERNS: Record<string, PatternDef> = {
         if (!g.tick(k, 90)) continue;
         const n = g.n(22);
         const rot = g.rnd() * TAU;
+        // 星の形の「尖り」を L で強め、遅い扇の逃げ道を狭める
+        const sharp = 2.2 + 0.8 * g.track();
         for (let j = 0; j < n; j++) {
           const th = rot + (j * TAU) / n;
-          const c = Math.abs(Math.cos(2.5 * (th - rot)));
-          const m = 0.62 + 0.38 * c * c * c;
+          const c = Math.abs(Math.cos(sharp * (th - rot)));
+          const m = 0.55 + 0.45 * c * c * c;
           if (g.spawn(g.emitX[k], g.emitY[k], th, g.v(1.5) * m, T_STAR, cols[k]) < 0) break;
         }
         g.shot();
@@ -399,7 +441,7 @@ export const PATTERNS: Record<string, PatternDef> = {
       if (g.tick(3, 60)) {
         const c = g.n(2.6);
         for (let k = 0; k < c; k++) {
-          const i = g.spawn(10 + g.rnd() * (W - 20), -6, PI / 2, g.v(0.8 + g.rnd() * 0.8), T_SMALL, C_WHITE);
+          const i = g.spawn(10 + g.rnd() * (W - 20), -6, PI / 2, g.v(0.85 + g.rnd() * 0.85), T_SMALL, C_WHITE);
           if (i >= 0) g.bghost[i] = 20;
         }
       }
@@ -407,7 +449,7 @@ export const PATTERNS: Record<string, PatternDef> = {
   },
 
   // ═══ STAGE 4 櫻優 ═══════════════════════════════════════
-  // ハート（反射する対の弾）
+  // ハート（反射する対の弾）— 扇が track で自機に収束
   s4p1: {
     init(g) {
       g.wander = false;
@@ -418,9 +460,10 @@ export const PATTERNS: Record<string, PatternDef> = {
       if (g.tick(0, 28)) {
         const m = g.n(6.5);
         const base = g.aim(g.bossX, g.bossY);
-        const spread = 1.1;
+        // 高難度ほど扇が狭く＝逃げ場がない
+        const spread = 1.35 / g.track();
         for (let k = 0; k < m; k++) {
-          const a = base + (m > 1 ? (k / (m - 1) - 0.5) * spread : 0) + (g.rnd() - 0.5) * 0.08;
+          const a = base + (m > 1 ? (k / (m - 1) - 0.5) * spread : 0) + (g.rnd() - 0.5) * (0.1 / g.track());
           const mir = PI - a;
           const d = Math.abs(Math.atan2(Math.sin(a - mir), Math.cos(a - mir)));
           const s = g.v(1.8);
@@ -445,23 +488,25 @@ export const PATTERNS: Record<string, PatternDef> = {
       }
     },
   },
-  // 不理解の引力（ホーミング）
+  // 不理解の引力（ホーミング）— 角速度・追尾時間が track で強化
   s4p2: {
     update(g, _t) {
       if (g.tick(0, 40)) {
         const n = g.n(8);
         const a0 = g.rnd() * TAU;
+        const turn = 0.009 * g.track();
+        const dur = 90 + 50 * g.track();
         for (let k = 0; k < n; k++) {
           const i = g.spawn(g.bossX, g.bossY, a0 + (k * TAU) / n, g.v(1.6), T_HEART, C_PINK);
           if (i < 0) break;
           g.bbeh[i] = B_HOMING;
-          g.b0[i] = 0.011;
-          g.b1[i] = 110;
+          g.b0[i] = turn;
+          g.b1[i] = dur;
         }
         g.shot();
       }
       if (g.tick(1, 12)) {
-        g.fv[0] += 0.21;
+        g.fv[0] += 0.16 + 0.08 * g.track();
         const arms = g.n(3);
         for (let k = 0; k < arms; k++) {
           g.spawn(g.bossX, g.bossY, g.fv[0] + (k * TAU) / arms, g.v(1.8), T_SMALL, C_VIOLET);
@@ -484,6 +529,8 @@ export const PATTERNS: Record<string, PatternDef> = {
       g.emitY[1] = 70;
       if (g.tick(0, 9)) {
         const streams = g.n(1.6);
+        // 振幅を gap で縮小 → 二流の間の逃げ道が狭まる
+        const amp = 42 * g.gp + 12;
         for (let e = 0; e < 2; e++) {
           for (let s = 0; s < streams; s++) {
             const a = PI / 2 + (e ? -1 : 1) * 0.35 * Math.sin(g.phaseT * 0.012 + s * 1.3);
@@ -492,15 +539,19 @@ export const PATTERNS: Record<string, PatternDef> = {
             g.bbeh[i] = B_SINE;
             g.b0[i] = g.emitX[e];
             g.b1[i] = g.emitY[e];
-            g.b2[i] = e ? 36 : -36;
-            g.b3[i] = 0.07;
+            g.b2[i] = e ? amp : -amp;
+            g.b3[i] = 0.06 + 0.02 * g.track();
           }
         }
       }
-      if (t % 300 === 250) {
+      // 収束周期を L で短縮
+      const collapseCyc = Math.max(180, Math.round(300 / (0.75 + 0.25 * g.R)));
+      if (t % collapseCyc === Math.round(collapseCyc * 0.83)) {
         for (let i = 0; i < g.bn; i++) {
           if (g.bbeh[i] !== B_SINE) continue;
           g.bbeh[i] = B_LINEAR;
+          // 収束後は自機方向へ少し寄せる
+          g.ba[i] = g.aim(g.bx[i], g.by[i]) * 0.35 + g.ba[i] * 0.65;
           g.bs[i] = g.v(2.0);
         }
         g.popText(W / 2, 220, POP_KANSOKU);
@@ -514,14 +565,15 @@ export const PATTERNS: Record<string, PatternDef> = {
   },
 
   // ═══ STAGE 5 倉石暁 ═════════════════════════════════════
-  // 入門ガイド：✝の点群が編隊で飛ぶ
+  // 入門ガイド：✝の点群が編隊で飛ぶ — 自機方向への収束が track で強化
   s5p1: {
     update(g, _t) {
       if (g.tick(0, 72)) {
         const count = g.n(2.6);
         const base = g.aim(g.bossX, g.bossY);
         for (let c = 0; c < count; c++) {
-          const dir = base + (c * TAU) / count;
+          // 複数編隊の開き角を track で狭める
+          const dir = base + ((c - (count - 1) / 2) * 0.55) / g.track();
           const rot = dir - PI / 2;
           const cr = Math.cos(rot);
           const sr = Math.sin(rot);
@@ -543,25 +595,29 @@ export const PATTERNS: Record<string, PatternDef> = {
       }
       if (g.tick(1, 12)) {
         const arms = g.n(2.6);
-        g.fv[0] += 0.19;
+        g.fv[0] += 0.14 + 0.08 * g.track();
         for (let k = 0; k < arms; k++) g.spawn(g.bossX, g.bossY, g.fv[0] + (k * TAU) / arms, g.v(1.5), T_CROSS, C_WHITE);
       }
     },
   },
-  // グレートチェーン（五段階の階層リング）
+  // グレートチェーン（五段階の階層リング）— 扉の幅が gapMul で狭まる
   s5p2: {
     update(g, t) {
-      if (g.tick(0, 190)) {
+      // 階層リングの頻度を上げ、息継ぎを短く
+      if (g.tick(0, 150)) {
         const cx = g.bossX;
         const cy = g.bossY;
         const door = g.aim(cx, cy);
+        const skip = Math.max(0.4, 2.0 * g.gp);
         for (let j = 0; j < 5; j++) {
-          const n = g.n(8 + 2 * j);
+          const n = g.n(9 + 2 * j);
           const r0 = 12 + j * 16;
-          const av = (j & 1 ? 1 : -1) * (0.0015 + 0.0006 * j) * g.sp;
-          for (let k = 2; k <= n - 2; k++) {
+          const av = (j & 1 ? 1 : -1) * (0.0018 + 0.0007 * j) * g.sp * g.track();
+          const k0 = Math.max(1, Math.floor(skip));
+          const k1 = n - k0;
+          for (let k = k0; k <= k1; k++) {
             const th = door + (k * TAU) / n;
-            const i = g.spawn(cx + Math.cos(th) * r0, cy + Math.sin(th) * r0, th, g.v(1.7), j === 0 ? T_MED : T_SMALL, CHAIN_COLS[j]);
+            const i = g.spawn(cx + Math.cos(th) * r0, cy + Math.sin(th) * r0, th, g.v(1.75), j === 0 ? T_MED : T_SMALL, CHAIN_COLS[j]);
             if (i < 0) break;
             g.bbeh[i] = B_POLAR;
             g.b0[i] = cx;
@@ -573,25 +629,30 @@ export const PATTERNS: Record<string, PatternDef> = {
         }
         g.shot();
       }
-      if (t > 40 && g.tick(1, 60)) {
-        aimedFan(g, g.bossX, g.bossY, g.n(1.6), 0.15, g.v(2.5), T_SMALL, C_WHITE);
+      if (t > 40 && g.tick(1, 48)) {
+        const spread = 0.2 / g.track();
+        aimedFan(g, g.bossX, g.bossY, g.n(2.0), spread, g.v(2.5), T_SMALL, C_WHITE);
       }
     },
   },
-  // 前-原✝本質✝（巨大弾が四散する）
+  // 前-原✝本質✝（巨大弾が四散する）— 分裂数が L で増え、狙いが収束
   s5p3: {
     update(g, _t) {
       if (g.tick(0, 100)) {
         const c = g.n(7);
         const base = g.aim(g.bossX, g.bossY);
+        // 分裂子弾数・速度を強化
+        const kids = Math.max(4, Math.round(4 + 2.5 * g.dn));
         for (let k = 0; k < c; k++) {
-          const i = g.spawn(g.bossX, g.bossY, base + (k * TAU) / c, g.v(2.4), T_LARGE, C_VIOLET);
+          // 親弾の配置角を track で自機方向に寄せる
+          const a = base + ((k - (c - 1) / 2) * (TAU / Math.max(1, c))) / Math.max(1, 0.6 + 0.4 * g.track());
+          const i = g.spawn(g.bossX, g.bossY, a, g.v(2.4), T_LARGE, C_VIOLET);
           if (i < 0) break;
           g.bacc[i] = -0.03;
           g.bmin[i] = g.v(0.5);
           g.bbeh[i] = B_SPLIT;
-          g.b0[i] = 48;
-          g.b1[i] = 5;
+          g.b0[i] = Math.max(28, Math.round(52 / g.track()));
+          g.b1[i] = kids;
           g.b2[i] = 1;
           g.b3[i] = g.v(1.9);
         }
@@ -611,7 +672,7 @@ export const PATTERNS: Record<string, PatternDef> = {
     update(g, t) {
       if (g.tick(0, 72)) {
         const n = g.n(15);
-        g.fv[0] += 0.3;
+        g.fv[0] += 0.22 + 0.12 * g.track();
         for (let k = 0; k < n; k++) {
           const i = g.spawn(g.bossX, g.bossY, g.fv[0] + (k * TAU) / n, g.v(2.8), T_MED, C_RED);
           if (i < 0) break;
@@ -624,23 +685,28 @@ export const PATTERNS: Record<string, PatternDef> = {
         const n = g.n(14);
         const dir = g.cnt[0]++ & 1 ? 1 : -1;
         const a0 = g.rnd() * TAU;
+        // 内環の自転速度を track で上げ、下部での隙間回転を速く
+        const spin = dir * 0.003 * g.track();
         for (let k = 0; k < n; k++) {
           const i = g.spawn(g.bossX, g.bossY, a0 + (k * TAU) / n, g.v(1.3), T_SMALL, C_WHITE);
           if (i < 0) break;
-          g.bav[i] = dir * 0.004;
+          g.bav[i] = spin;
         }
       }
       if (t % 150 === 75) g.popText(g.bossX + (g.rnd() - 0.5) * 140, g.bossY + 50, POP_HA);
     },
   },
-  // 「見てない」（左右から消える米弾）
+  // 「見てない」（左右から消える米弾）— 下部帯を重点的に塞ぐ（極端な集中は避ける）
   s6p2: {
     update(g, t) {
       if (g.tick(0, 12)) {
         const c = g.n(2.4);
+        // 高難度ほど自機ライン付近に寄せるが、全面カバーは残す
+        const loBias = 0.15 + 0.28 * g.track();
         for (let k = 0; k < c; k++) {
           const left = g.rnd() < 0.5;
-          const i = g.spawn(left ? -8 : W + 8, 60 + g.rnd() * 540, left ? 0 : PI, g.v(1.4 + g.rnd() * 1.4), T_RICE, g.rnd() < 0.5 ? C_GREEN : C_ORANGE);
+          const y = 50 + g.rnd() * (280 + loBias * 220);
+          const i = g.spawn(left ? -8 : W + 8, Math.min(H - 36, y), left ? 0 : PI, g.v(1.4 + g.rnd() * 1.4), T_RICE, g.rnd() < 0.5 ? C_GREEN : C_ORANGE);
           if (i < 0) break;
           g.bflg[i] |= FL_FADE;
           g.bghost[i] = 18;
@@ -659,7 +725,7 @@ export const PATTERNS: Record<string, PatternDef> = {
       if (g.tick(0, 44)) {
         const K = ROSE_K[g.cnt[0]++ % ROSE_K.length];
         const n = g.n(34);
-        g.fv[0] += 0.37;
+        g.fv[0] += 0.28 + 0.14 * g.track();
         const rot = g.fv[0];
         for (let j = 0; j < n; j++) {
           const th = rot + (j * TAU) / n;
@@ -671,24 +737,24 @@ export const PATTERNS: Record<string, PatternDef> = {
         g.shot();
       }
       if (t > 30 && g.tick(1, 90)) {
-        aimedFan(g, g.bossX, g.bossY, g.n(3.2), 0.1, g.v(2.4), T_KUNAI, C_WHITE);
+        const spread = 0.14 / g.track();
+        aimedFan(g, g.bossX, g.bossY, g.n(3.2), spread, g.v(2.4), T_KUNAI, C_WHITE);
       }
       if (t % 240 === 120) g.popText(g.bossX, g.bossY - 56, POP_OMOSHIROI);
     },
   },
-  // 「来年もある」（花びら＋対の米弾＋時折の大弾）
+  // 「来年もある」— ハート螺旋＋米弾＋十字環（装飾パーティクルなし。画面上の弾はすべて当たり判定あり）
   s6p4: {
     init(g) {
       g.wander = false;
       g.moveBoss(W / 2, 130, 60);
-      g.petals = true;
     },
     update(g, t) {
       if (g.tick(0, 9)) {
         const arms = g.n(3.4);
-        g.fv[0] += 0.11 * Math.sin(g.phaseT * 0.004) + 0.06;
+        g.fv[0] += 0.08 * Math.sin(g.phaseT * 0.004) + 0.05 + 0.04 * g.track();
         for (let k = 0; k < arms; k++) {
-          if (g.spawn(g.bossX, g.bossY, g.fv[0] + (k * TAU) / arms, g.v(1.7), T_PETAL, C_PINK) < 0) break;
+          if (g.spawn(g.bossX, g.bossY, g.fv[0] + (k * TAU) / arms, g.v(1.7), T_HEART, C_PINK) < 0) break;
         }
         const w = Math.max(1, arms - 1);
         for (let k = 0; k < w; k++) {
@@ -726,7 +792,7 @@ export function attractPattern(g: Engine, t: number): void {
   }
   if (t % 90 === 45) {
     for (let k = 0; k < 12; k++) {
-      const i = g.spawn(cx, cy, (k * TAU) / 12 + t * 0.01, 1.6, T_PETAL, C_PINK);
+      const i = g.spawn(cx, cy, (k * TAU) / 12 + t * 0.01, 1.6, T_HEART, C_PINK);
       if (i >= 0) g.bav[i] = 0.004;
     }
   }

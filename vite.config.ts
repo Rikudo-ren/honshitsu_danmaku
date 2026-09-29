@@ -12,8 +12,17 @@ const __dirname = path.dirname(__filename);
 export default defineConfig({
   plugins: [react(), tailwindcss(), viteSingleFile()],
   server: {
-    // サンドボックスのプレビュー用ホスト（*.e2b.app）を許可する
-    allowedHosts: ['.e2b.app'],
+    host: '0.0.0.0',
+    port: 5173,
+    strictPort: true,
+    // サンドボックスのプレビュー用ホスト（*.e2b.app など）をすべて許可
+    allowedHosts: true,
+  },
+  preview: {
+    host: '0.0.0.0',
+    port: 5173,
+    strictPort: true,
+    allowedHosts: true,
   },
   resolve: {
     alias: {
